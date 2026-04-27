@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- Inherit from HBase Build Configuration (same as other HBase modules) -->
+  <parent>
+    <groupId>org.apache.hbase</groupId>
+    <artifactId>hbase-build-configuration</artifactId>
+    <version>${revision}</version>
+    <relativePath>../hbase-build-configuration</relativePath>
+  </parent>
+
+  <artifactId>hbase-hdfs-tier</artifactId>
+  <packaging>jar</packaging>
+
+  <name>Apache HBase - HDFS Tier Metadata Capture</name>
+  <description>HBase coprocessor for capturing HFile metadata in HDFS cache tier</description>
+
+
+  <dependencies>
+    <!-- HBase Client - uses parent's version management -->
+    <dependency>
+      <groupId>org.apache.hbase</groupId>
+      <artifactId>hbase-client</artifactId>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- HBase Server - uses parent's version management -->
+    <dependency>
+      <groupId>org.apache.hbase</groupId>
+      <artifactId>hbase-server</artifactId>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- HBase Common - uses parent's version management -->
+    <dependency>
+      <groupId>org.apache.hbase</groupId>
+      <artifactId>hbase-common</artifactId>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Hadoop HDFS -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-hdfs</artifactId>
+      <version>${hadoop-three.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Hadoop Common - explicit version required for flatten plugin -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-common</artifactId>
+      <version>${hadoop-three.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Logging - uses parent's version management -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Test Dependencies - JUnit 5 (Jupiter) -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-api</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-engine</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Maven JAR Plugin - add coprocessor metadata to manifest -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <configuration>
+          <archive>
+            <manifestEntries>
+              <Implementation-Title>${project.name}</Implementation-Title>
+              <Implementation-Version>${project.version}</Implementation-Version>
+              <Coprocessor-Classes>org.apache.hadoop.hbase.hdfs.tier.HdfsTierObserver</Coprocessor-Classes>
+            </manifestEntries>
+          </archive>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

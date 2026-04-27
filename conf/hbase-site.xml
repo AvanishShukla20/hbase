@@ -43,12 +43,66 @@
     <name>hbase.cluster.distributed</name>
     <value>false</value>
   </property>
+
   <property>
     <name>hbase.tmp.dir</name>
-    <value>${env.HBASE_HOME:-.}/tmp</value>
+    <value>/Users/avshukla/projects/hbase/logs/tmp</value>
   </property>
+
   <property>
     <name>hbase.unsafe.stream.capability.enforce</name>
     <value>false</value>
   </property>
+
+<!--  <property>-->
+<!--    <name>hbase.coprocessor.region.classes</name>-->
+<!--    <value>org.apache.hadoop.hbase.hdfs.tier.HdfsTierObserver</value>-->
+<!--  </property>-->
+
+
+  <!-- HDFS Tier Storage Configuration -->
+
+<!--  <property>-->
+<!--    <name>hbase.hdfstier.max.storage.size</name>-->
+<!--    <value>107374182400</value>-->
+<!--    <description>Maximum size of HDFS tier cache storage in bytes (100 GB default)</description>-->
+<!--  </property>-->
+
+<!--  <property>-->
+<!--    <name>hbase.regionserver.info.port</name>-->
+<!--    <value>16030</value>-->
+<!--  </property>-->
+
+<!-- ZooKeeper configuration -->
+<!--  <property>-->
+<!--    <name>hbase.zookeeper.quorum</name>-->
+<!--    <value>localhost</value>-->
+<!--  </property>-->
+<!--  <property>-->
+<!--    <name>hbase.master.hostname</name>-->
+<!--    <value>localhost</value>-->
+<!--  </property>-->
+<!--  <property>-->
+<!--    <name>hbase.regionserver.hostname</name>-->
+<!--    <value>localhost</value>-->
+<!--  </property>-->
+
+
+<!--  COPROCESSORS: Comment these out for first run, uncomment after creating hdfsTier:meta table -->
+
+
+<!--  <property>-->
+<!--    <name>hbase.hdfstier.eviction.threshold</name>-->
+<!--    <value>0.85</value>-->
+<!--    <description>Eviction starts when storage reaches 85% of max size</description>-->
+<!--  </property>-->
+
+<!--  <property>-->
+<!--    <name>hbase.hdfstier.max.storage.size</name>-->
+<!--    <value>107374182400</value>-->
+<!--    <description>Maximum size of HDFS tier cache storage in bytes (100 GB default)</description>-->
+<!--  </property>-->
+
+
+
 </configuration>
