@@ -25,11 +25,14 @@
 # into the startup scripts (bin/hbase, etc.)
 
 # The java implementation to use.  Java 1.8+ required.
-# export JAVA_HOME=/usr/java/jdk1.8.0/
+#export JAVA_HOME=
 
 # Extra Java CLASSPATH elements.  Optional.
-# export HBASE_CLASSPATH=
 
+#
+#export HBASE_CLASSPATH=
+
+#  export HBASE_OPTS="$HBASE_OPTS -Djava.net.preferIPv4Stack=true"
 # The maximum amount of heap to use. Default is left to JVM default.
 # export HBASE_HEAPSIZE=1G
 

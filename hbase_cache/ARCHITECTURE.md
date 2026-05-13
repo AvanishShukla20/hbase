@@ -11,10 +11,11 @@ This document provides a complete understanding of the HdfsTier metadata capture
 ### 1. **HdfsTierMetaTable.java**
 Defines the metadata table schema and row key structure.
 
-**Row Key Format:** `hfileName#createTimestamp`
-- Example: `abc123_SeqId_1_#1704067200000`
-- Ensures uniqueness per HFile flush event
-- Enables time-based range scans
+**Row Key Format:** `regionEncodedName#hfileName`
+- Example: `abc123def#abc123_SeqId_1_`
+- Ensures uniqueness and deterministic lookups (one HFile = one row)
+- Enables direct row access without scanning
+- Simplified design: No timestamp needed for direct targeting
 
 **Column Families:**
 - `info`: Static metadata (name, region, table, size, path)
@@ -82,12 +83,13 @@ captureHFileMetadata(storeFile, region, cachePath)
 Extract metadata:
   - hfileName = "abc123_SeqId_1_"
   - regName = "mytable,row1,1704067200000.abc123"
+  - encodedRegName = "abc123"
   - tableName = "mytable"
   - size = 134217728 (128MB)
   - createTime = System.currentTimeMillis() → 1704067200000
   ↓
 Build row key:
-  rowKey = "abc123_SeqId_1_#1704067200000"
+  rowKey = "abc123#abc123_SeqId_1_"
   ↓
 Create Put mutation:
   Put(rowKey)
@@ -95,9 +97,6 @@ Create Put mutation:
     └─> CF:transition → 3 columns (state=ACTIVE, transTime, evicted=false)
   ↓
 bufferedMutator.mutate(put)  ← Returns immediately (<0.1ms)
-  ↓
-Track timestamp:
-  fileTimestamps.put("/hbase_cache/.../abc123_SeqId_1_", 1704067200000)
   ↓
 Return to system (flush completes)
 
@@ -120,7 +119,7 @@ Buffer cleared, continues accumulating
 - ✅ HFile successfully flushed by system
 - ✅ Metadata row created in hdfsTier:meta
 - ✅ State = ACTIVE, ready for cache management
-- ✅ Timestamp tracked for future state updates
+- ✅ Row key format enables direct targeted updates
 
 ---
 
@@ -146,19 +145,19 @@ Thread: RegionServerCompaction-Thread-3
 For each old file in request.getFiles():
   ├─> oldPath = /hbase/data/.../abc123_SeqId_1_
   ├─> oldCachePath = /hbase_cache/.../abc123_SeqId_1_
-  ├─> Lookup timestamp: fileTimestamps.get(oldCachePath) → 1704067200000
-  └─> Update state: updateFileStateToCompacted("abc123_SeqId_1_", 1704067200000)
+  ├─> Extract regionEncodedName from region
+  └─> Update state: updateFileStateToCompacted(regionEncodedName, "abc123_SeqId_1_")
 
 STEP 3: State Update (Async)
 ────────────────────────────────────────────
-updateFileStateToCompacted(hfileName, timestamp)
+updateFileStateToCompacted(regionEncodedName, hfileName)
   ↓
 Async executor submits task (non-blocking, returns immediately)
   ↓
 Background worker thread:
-  └─> updateFileStateSync("abc123_SeqId_1_", 1704067200000, "COMPACTED")
+  └─> updateFileStateSync(regionEncodedName, hfileName, "COMPACTED")
       ↓
-      Build row key: "abc123_SeqId_1_#1704067200000"
+      Build row key: "abc123#abc123_SeqId_1_"
       ↓
       Create Put:
         Put(rowKey)
@@ -166,8 +165,6 @@ Background worker thread:
           └─> CF:transition:transTime = currentTime
       ↓
       bufferedMutator.mutate(put)
-      ↓
-      Cleanup: fileTimestamps.remove(oldCachePath)
 
 STEP 4: Capture New Compacted File
 ────────────────────────────────────────────
@@ -180,10 +177,8 @@ newCachePath = /hbase_cache/.../mno345_SeqId_11_
 captureHFileMetadata(resultFile, region, newCachePath)
   ↓
 Creates new row:
-  rowKey = "mno345_SeqId_11_#1704067250000"
+  rowKey = "abc123#mno345_SeqId_11_"
   state = ACTIVE
-  ↓
-fileTimestamps.put(newCachePath, 1704067250000)
 ```
 
 **Result:**
@@ -197,32 +192,25 @@ fileTimestamps.put(newCachePath, 1704067250000)
 ### Scenario 3: Cache Eviction (Quota Management)
 
 ```
-STEP 1: Eviction Service (Your Future Code)
+STEP 1: Eviction Service (Your Implementation)
 ────────────────────────────────────────────
-Eviction policy triggered (cache > 80% full)
+Eviction policy triggered (cache > 90% full)
   ↓
 Scan hdfsTier:meta for eviction candidates:
   SELECT * FROM hdfsTier:meta
-  WHERE transition:currState = 'COMPACTED'  ← Safe to evict
-  ORDER BY info:createTime ASC  ← Oldest first
+  WHERE transition:currState = 'ACTIVE'  ← Safe to evict
+  ORDER BY info:lastAccess ASC  ← Least recently used first (LRU)
   LIMIT 100
   ↓
-Extract: [(hfileName1, timestamp1), (hfileName2, timestamp2), ...]
+Extract: [(regionEncodedName, hfileName), ...]
 
-STEP 2: Delete from HDFS Cache
-────────────────────────────────────────────
-For each candidate:
-  hdfs.delete(/hbase_cache/.../hfileName)
-  ↓
-File removed from SSD tier
-
-STEP 3: Update Metadata State
+STEP 2: Mark Files as Evicted (No Physical Delete)
 ────────────────────────────────────────────
 updateFileStateToEvictedBatch(fileEntries)
   ↓
 Builds batch Put operations:
   For each entry:
-    rowKey = "hfileName#timestamp"
+    rowKey = "regionEncodedName#hfileName"
     Put(rowKey)
       ├─> CF:transition:currState = "EVICTED"
       ├─> CF:transition:evicted = true
@@ -234,8 +222,8 @@ Batch written to hdfsTier:meta
 ```
 
 **Result:**
-- ✅ Files deleted from cache
-- ✅ Metadata marked EVICTED
+- ✅ Files marked EVICTED in metadata (not physically deleted)
+- ✅ Metadata state updated to EVICTED
 - ✅ Eviction candidates excluded from future queries
 - ✅ Audit trail preserved
 
@@ -553,14 +541,18 @@ Result: Zero blocking on compaction threads
 ### Bounded Memory Growth
 
 ```
-fileTimestamps map:
-  - Entry per active file in region
-  - Typical region: 10-100 HFiles
-  - 100 regions: 1000-10000 entries
-  - Memory: ~50KB - 500KB
-  - Cleanup on compaction: Old entries removed
+BufferedMutator:
+  - Write buffer: 16MB (configurable)
+  - Handles ~8K-16K pending mutations
+  - Periodic flush every 5 seconds
+  - Memory: ~16MB per RegionServer
   
-Result: Memory usage bounded and predictable
+Async Executor:
+  - Queue capacity: Unbounded LinkedBlockingQueue
+  - Worker threads: 5-20 (configurable)
+  - Thread memory: ~10MB
+  
+Result: Memory usage bounded and predictable (~30-50MB total)
 ```
 
 ---
@@ -578,7 +570,7 @@ Result: Memory usage bounded and predictable
 
 ### Key Design Decisions
 
-1. **Row key = hfileName#timestamp** - Ensures uniqueness, enables time queries
+1. **Row key = regionEncodedName#hfileName** - Ensures uniqueness, enables direct lookups
 2. **BufferedMutator** - High-throughput batched writes, non-blocking
 3. **Async executor** - State updates don't block compaction
 4. **Failure isolation** - Metadata failures don't fail system operations
@@ -590,6 +582,7 @@ Result: Memory usage bounded and predictable
 2. Monitor capture rate and failures
 3. Implement eviction policy using metadata
 4. Build cache pre-warming using metadata
+5. Create monitoring dashboard for cache tier health
 5. Create monitoring dashboard for cache tier health
 
 Your implementation is **complete, robust, and production-ready**! 🎉

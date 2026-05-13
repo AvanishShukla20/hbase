@@ -46,7 +46,8 @@
 
   <property>
     <name>hbase.tmp.dir</name>
-    <value>/Users/avshukla/projects/hbase/logs/tmp</value>
+    <value>${user.home}/hbase</value>
+    <description>Temporary directory on the local filesystem.</description>
   </property>
 
   <property>
@@ -54,55 +55,141 @@
     <value>false</value>
   </property>
 
-<!--  <property>-->
-<!--    <name>hbase.coprocessor.region.classes</name>-->
-<!--    <value>org.apache.hadoop.hbase.hdfs.tier.HdfsTierObserver</value>-->
-<!--  </property>-->
+  <property>
+    <name>hbase.coprocessor.region.classes</name>
+    <value>org.apache.hadoop.hbase.hdfs.tier.HdfsTierObserver</value>
+  </property>
 
 
   <!-- HDFS Tier Storage Configuration -->
 
-<!--  <property>-->
-<!--    <name>hbase.hdfstier.max.storage.size</name>-->
-<!--    <value>107374182400</value>-->
-<!--    <description>Maximum size of HDFS tier cache storage in bytes (100 GB default)</description>-->
-<!--  </property>-->
+  <!-- HFile Access Tracking Configuration -->
+  <property>
+    <name>hbase.hfile.access.tracking.enabled</name>
+    <value>true</value>
+    <description>Enable HFile access tracking for metadata updates</description>
+  </property>
 
-<!--  <property>-->
-<!--    <name>hbase.regionserver.info.port</name>-->
-<!--    <value>16030</value>-->
-<!--  </property>-->
+  <property>
+    <name>hbase.hfile.access.queue.size</name>
+    <value>200000</value>
+    <description>Max events in queue before dropping (200K = ~20MB memory)</description>
+  </property>
 
-<!-- ZooKeeper configuration -->
-<!--  <property>-->
-<!--    <name>hbase.zookeeper.quorum</name>-->
-<!--    <value>localhost</value>-->
-<!--  </property>-->
-<!--  <property>-->
-<!--    <name>hbase.master.hostname</name>-->
-<!--    <value>localhost</value>-->
-<!--  </property>-->
-<!--  <property>-->
-<!--    <name>hbase.regionserver.hostname</name>-->
-<!--    <value>localhost</value>-->
-<!--  </property>-->
+  <property>
+    <name>hbase.hfile.access.worker.threads</name>
+    <value>4</value>
+    <description>Worker threads for processing access events (auto-tuned to CPU/4)</description>
+  </property>
+
+  <property>
+    <name>hbase.metadata.update.max.retries</name>
+    <value>3</value>
+    <description>Immediate retry attempts within worker thread</description>
+  </property>
+
+  <property>
+    <name>hbase.metadata.update.retry.delay.ms</name>
+    <value>100</value>
+    <description>Initial retry delay in milliseconds (exponential backoff)</description>
+  </property>
+
+  <property>
+    <name>hbase.metadata.update.max.total.retries</name>
+    <value>5</value>
+    <description>Max retries by FailedUpdateRetryManager before giving up</description>
+  </property>
+
+  <property>
+    <name>hbase.metadata.retry.interval.minutes</name>
+    <value>5</value>
+    <description>Retry failed updates every N minutes</description>
+  </property>
+
+  <property>
+    <name>hbase.metadata.update.failure.threshold</name>
+    <value>0.05</value>
+    <description>Alert when failure rate exceeds this threshold (5%)</description>
+  </property>
+
+  <property>
+    <name>hbase.metadata.max.tracked.failures</name>
+    <value>10000</value>
+    <description>Max failed updates to track in memory</description>
+  </property>
+
+  <property>
+    <name>hbase.hfile.access.monitor.interval.sec</name>
+    <value>60</value>
+    <description>Log statistics every N seconds</description>
+  </property>
+
+  <!-- HDFS Tier Storage Monitor Configuration -->
+  <property>
+    <name>hbase.hdfstier.max.storage.size</name>
+    <value>107374182400</value>
+    <description>Maximum storage size for HDFS tier cache in bytes (default: 100 GB)</description>
+  </property>
+
+  <property>
+    <name>hbase.hdfstier.reconciliation.interval.minutes</name>
+    <value>10</value>
+    <description>Interval for reconciliation scan of hdfsTier:meta table to correct storage metrics (in minutes)</description>
+  </property>
+
+  <!-- HDFS Tier Metrics Server Configuration -->
+  <property>
+    <name>hbase.hdfstier.metrics.port</name>
+    <value>8090</value>
+    <description>HTTP port for HdfsTier metrics server (exposes /metrics, /health, /reconcile endpoints)</description>
+  </property>
+
+  <!-- HDFS Tier Eviction Configuration -->
+  <property>
+    <name>hbase.hdfstier.eviction.enabled</name>
+    <value>true</value>
+    <description>Enable automatic eviction of HFiles when storage threshold is exceeded</description>
+  </property>
+
+  <property>
+    <name>hbase.hdfstier.eviction.policy</name>
+    <value>LRU</value>
+    <description>Eviction policy to use: LRU (Least Recently Used), FIFO, or custom policy class name</description>
+  </property>
+
+  <property>
+    <name>hbase.hdfstier.eviction.threshold</name>
+    <value>90.0</value>
+    <description>Storage usage percentage that triggers eviction (default: 90%)</description>
+  </property>
+
+  <property>
+    <name>hbase.hdfstier.eviction.target</name>
+    <value>70.0</value>
+    <description>Target storage usage percentage to evict down to (default: 70%)</description>
+  </property>
 
 
-<!--  COPROCESSORS: Comment these out for first run, uncomment after creating hdfsTier:meta table -->
+  <property>
+    <name>hbase.hdfstier.storage.max.bytes</name>
+    <value>107374182400</value>
+    <description>Maximum storage in bytes for eviction calculations (default: 100 GB, should match hbase.hdfstier.max.storage.size)</description>
+  </property>
 
+  <!-- ===================================================================== -->
+  <!-- HDFS Tier Eviction Chore Configuration                                -->
+  <!-- ===================================================================== -->
 
-<!--  <property>-->
-<!--    <name>hbase.hdfstier.eviction.threshold</name>-->
-<!--    <value>0.85</value>-->
-<!--    <description>Eviction starts when storage reaches 85% of max size</description>-->
-<!--  </property>-->
+  <property>
+    <name>hbase.hdfstier.eviction.chore.period.sec</name>
+    <value>300</value>
+    <description>Period in seconds for the eviction chore to run (default: 300 seconds = 5 minutes). The chore checks storage utilization and triggers eviction if threshold is exceeded.</description>
+  </property>
 
-<!--  <property>-->
-<!--    <name>hbase.hdfstier.max.storage.size</name>-->
-<!--    <value>107374182400</value>-->
-<!--    <description>Maximum size of HDFS tier cache storage in bytes (100 GB default)</description>-->
-<!--  </property>-->
-
-
+  <property>
+    <name>hbase.hdfstier.eviction.chore.delay.sec</name>
+    <value>60</value>
+    <description>Initial delay in seconds before the first eviction chore run (default: 60 seconds = 1 minute). Allows time for HBase to stabilize after startup.</description>
+  </property>
 
 </configuration>
