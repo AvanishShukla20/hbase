@@ -32,6 +32,10 @@ public class HdfsTierMetaTable {
     public static final byte[] COL_CREATE_TIME = Bytes.toBytes("createTime");
     public static final byte[] COL_SIZE = Bytes.toBytes("size");
 
+    // Access tracking columns (added for HFile read tracking)
+    public static final byte[] COL_LAST_ACCESS = Bytes.toBytes("lastAccess");
+    public static final byte[] COL_ACCESS_COUNT = Bytes.toBytes("accessCount");
+
     // Transition column family qualifiers
     public static final byte[] COL_CURR_STATE = Bytes.toBytes("currState");
     public static final byte[] COL_TRANS_TIME = Bytes.toBytes("transTime");
@@ -42,22 +46,22 @@ public class HdfsTierMetaTable {
     public static final String ROW_KEY_DELIMITER = "#";
 
     /**
-     * Creates row key: {regionEncodedName}#{hfileName}#{createTimestamp}
+     * Creates row key: {regionEncodedName}#{hfileName}
      *
-     * EXAMPLE: "abc123def#file_456.hfile#1704067200000"
-     *          ↑ region   ↑ filename      ↑ timestamp
+     * EXAMPLE: "abc123def#file_456.hfile"
+     *          ↑ region   ↑ filename
+     *
+     * SIMPLIFIED: Removed timestamp for easier direct lookups.
+     * Row key is now deterministic - one HFile = one row, always.
      *
      * @param regionEncodedName Encoded region name
      * @param hfileName Name of HFile
-     * @param createTimestamp Creation timestamp in milliseconds
      * @return row key bytes
      */
-    public static byte[] createRowKey(String regionEncodedName, String hfileName, long createTimestamp) {
+    public static byte[] createRowKey(String regionEncodedName, String hfileName) {
         String compositeKey = regionEncodedName
             + ROW_KEY_DELIMITER
-            + hfileName
-            + ROW_KEY_DELIMITER
-            + createTimestamp;
+            + hfileName;
         return Bytes.toBytes(compositeKey);
     }
 
@@ -65,62 +69,11 @@ public class HdfsTierMetaTable {
      * Parses composite row key back to components.
      *
      * @param rowKey Composite row key bytes
-     * @return Array [regionEncodedName, hfileName, timestamp_string]
+     * @return Array [regionEncodedName, hfileName]
      */
     public static String[] parseRowKey(byte[] rowKey) {
         String compositeKey = Bytes.toString(rowKey);
         return compositeKey.split(ROW_KEY_DELIMITER);
-        // Returns: [0]=regionEncodedName, [1]=hfileName, [2]=timestamp
     }
 
-//    /**
-//     * Creates the hdfsTier:meta table if it doesn't exist.
-//     *
-//     * THREAD-SAFETY: This method uses Admin which is thread-safe.
-//     * Multiple threads can call this concurrently - HBase Admin handles
-//     * synchronization internally.
-//     *
-//     * @param connection HBase connection (must be thread-safe ConnectionFactory instance)
-//     * @throws IOException If table creation fails
-//     */
-//    public static void createTableIfNotExists(Connection connection) throws IOException {
-//        // Admin is AutoCloseable and thread-safe
-//        try (Admin admin = connection.getAdmin()) {
-//            // tableExists() is thread-safe - HBase handles concurrent checks
-//            if (admin.tableExists(TABLE_NAME)) {
-//                LOG.info("Table {} already exists", TABLE_NAME);
-//                return;
-//            }
-//
-//            // RACE CONDITION HANDLING:
-//            // If multiple threads reach here simultaneously, HBase will throw
-//            // TableExistsException for all but the first. We catch and ignore it.
-//            try {
-//                TableDescriptorBuilder tableBuilder = TableDescriptorBuilder.newBuilder(TABLE_NAME);
-//
-//                // Info CF - stores core metadata about HFile
-//                // MaxVersions=1: Only latest metadata matters (immutable after creation)
-//                ColumnFamilyDescriptorBuilder infoCfBuilder =
-//                    ColumnFamilyDescriptorBuilder.newBuilder(CF_INFO);
-//                infoCfBuilder.setMaxVersions(1); // Keep only latest version
-//
-//                // Transition CF - tracks state and lifecycle
-//                // MaxVersions=5: Keep history of state transitions for audit
-//                ColumnFamilyDescriptorBuilder transCfBuilder =
-//                    ColumnFamilyDescriptorBuilder.newBuilder(CF_TRANSITION);
-//                transCfBuilder.setMaxVersions(5); // Keep history of transitions
-//
-//                tableBuilder.setColumnFamily(infoCfBuilder.build());
-//                tableBuilder.setColumnFamily(transCfBuilder.build());
-//
-//                admin.createTable(tableBuilder.build());
-//                LOG.info("Created table {}", TABLE_NAME);
-//            } catch (org.apache.hadoop.hbase.TableExistsException e) {
-//                // RACE CONDITION RESOLVED:
-//                // Another thread created the table between our check and create.
-//                // This is safe - we can proceed as if we found it existed.
-//                LOG.info("Table {} already created by another thread", TABLE_NAME);
-//            }
-//        }
-//    }
 }

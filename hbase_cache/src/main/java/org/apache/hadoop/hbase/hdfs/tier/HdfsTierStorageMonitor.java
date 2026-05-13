@@ -4,6 +4,8 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.*;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.hdfs.tier.access.StoreFileScannerAccessTracker;
+import org.apache.hadoop.hbase.hdfs.tier.access.MetadataUpdateMonitor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,7 +20,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * HdfsTierStorageMonitor tracks real-time storage metrics for the HDFS tier cache layer.
  *
- * This singleton class maintains atomic counters for:
+ * This class maintains atomic counters for:
  * - Total storage used (bytes)
  * - Total allocated storage size (from configuration)
  * - Number of HFiles flushed
@@ -81,8 +83,7 @@ public class HdfsTierStorageMonitor {
       tempConnection = ConnectionFactory.createConnection(conf);
       LOG.info("HBase connection created for reconciliation");
     } catch (IOException e) {
-      LOG.warn("Failed to create HBase connection for reconciliation: {}. " +
-               "Reconciliation will not be available.", e.getMessage());
+      LOG.warn("Failed to create HBase connection for reconciliation: {}." , e.getMessage());
     }
     this.connection = tempConnection;
 
@@ -330,7 +331,7 @@ public class HdfsTierStorageMonitor {
       long previousTotal = totalStorageUsed.getAndSet(totalSize);
       long duration = System.currentTimeMillis() - startTime;
 
-      LOG.info("✅ Reconciliation COMPLETE in {}ms:", duration);
+      LOG.info("  Reconciliation COMPLETE in {}ms:", duration);
       LOG.info("   Active files: {}", activeFileCount);
       LOG.info("   Compacted files: {}", compactedFileCount);
       LOG.info("   Evicted files: {}", evictedFileCount);
@@ -344,7 +345,7 @@ public class HdfsTierStorageMonitor {
       lastReconciliationTime = System.currentTimeMillis();
 
     } catch (Exception e) {
-      LOG.error("❌ Failed to reconcile storage metrics: {}", e.getMessage(), e);
+      LOG.error(" Failed to reconcile storage metrics: {}", e.getMessage(), e);
     } finally {
       reconciliationInProgress.set(false);
     }
@@ -388,6 +389,14 @@ public class HdfsTierStorageMonitor {
       lastReconciliationTime,
       reconciliationInProgress.get()
     );
+  }
+
+  /**
+   * Get current storage statistics for eviction coordinator.
+   * This is an alias that provides a simplified view for eviction logic.
+   */
+  public StorageStats getStorageStats() {
+    return new StorageStats(totalStorageUsed.get());
   }
 
   /**
@@ -435,6 +444,21 @@ public class HdfsTierStorageMonitor {
     }
 
     LOG.info("HdfsTierStorageMonitor shut down successfully");
+  }
+
+  /**
+   * Simplified storage statistics for eviction coordinator.
+   */
+  public static class StorageStats {
+    private final long totalUsedBytes;
+
+    public StorageStats(long totalUsedBytes) {
+      this.totalUsedBytes = totalUsedBytes;
+    }
+
+    public long getTotalUsedBytes() {
+      return totalUsedBytes;
+    }
   }
 
   /**

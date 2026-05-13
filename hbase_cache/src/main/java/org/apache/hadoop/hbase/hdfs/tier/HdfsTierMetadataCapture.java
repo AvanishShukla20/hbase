@@ -3,7 +3,6 @@ package org.apache.hadoop.hbase.hdfs.tier;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.*;
 import org.apache.hadoop.hbase.regionserver.HStoreFile;
 import org.apache.hadoop.hbase.regionserver.Region;
@@ -14,8 +13,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -52,10 +49,10 @@ public class HdfsTierMetadataCapture {
     private final Connection connection;
     private final Configuration conf;
 
-    // BufferedMutator for high-throughput concurrent writes
+    // For high-throughput concurrent writes
     private final BufferedMutator bufferedMutator;
 
-    // Executor for async operations
+    // for async operations
     private final ExecutorService asyncExecutor;
 
     // Tracks pending writes for graceful shutdown
@@ -64,8 +61,7 @@ public class HdfsTierMetadataCapture {
     // Timeout for flush operations to prevent indefinite blocking
     private static final long FLUSH_TIMEOUT_SECONDS = 60;
 
-    // Dead-letter queue for failed writes (production retry mechanism)
-    // Stores failed mutations for later retry or manual intervention
+    // Dead letter queue for failed writes. It stores failed mutations for later retry or manual intervention
     private final BlockingQueue<FailedWrite> deadLetterQueue = new LinkedBlockingQueue<>(20000);
 
     // Statistics for monitoring
@@ -103,24 +99,9 @@ public class HdfsTierMetadataCapture {
         // Establishing a thread-safe connection
         this.connection = ConnectionFactory.createConnection(conf);
 
-//        // ********************** last attempt to clear this ***********
-//        // Ensure table exists before creating BufferedMutator
-//        HdfsTierMetaTable.createTableIfNotExists(connection);
-
-        // BufferedMutator configuration for concurrent writes
-
-        // THREAD-SAFETY:
-        // - BufferedMutator.mutate() is thread-safe (internal synchronization)
-        // - Multiple flush threads can call captureHFileMetadata() concurrently
-        // - BufferedMutator handles queuing and batching automatically
-        //
-        // FAILURE HANDLING:
-        // - ExceptionListener captures failures and queues for retry
-        // - Dead-letter queue with exponential backoff (10s, 30s, 60s)
-        // - Max 3 retries, then log for manual intervention
         BufferedMutatorParams params = new BufferedMutatorParams(HdfsTierMetaTable.TABLE_NAME)
             .writeBufferSize(16 * 1024 * 1024) // 16MB buffer (~1000-2000 HFile metadata rows)
-            .setWriteBufferPeriodicFlushTimeoutMs(5000) // Auto-flush every 5s (prevents stale data)
+            .setWriteBufferPeriodicFlushTimeoutMs(5000) // Auto-flush every 5s
             .listener(new BufferedMutator.ExceptionListener() {
                 @Override
                 public void onException(RetriesExhaustedWithDetailsException e,
@@ -144,6 +125,7 @@ public class HdfsTierMetadataCapture {
                                 boolean queued = deadLetterQueue.offer(failedWrite);
                                 if (!queued) {
                                     LOG.error("Retry queue full for {}", rowKeyStr);
+
                                 }
 
                                 totalFailures.incrementAndGet();
@@ -161,7 +143,7 @@ public class HdfsTierMetadataCapture {
 
         this.bufferedMutator = connection.getBufferedMutator(params);
 
-        // Executor for async state updates (non-critical path)
+        // Executor for async state updates
         // It prevents blocking the main flush/compaction thread
         this.asyncExecutor = new ThreadPoolExecutor(
             5,  // core threads
@@ -213,12 +195,22 @@ public class HdfsTierMetadataCapture {
                         continue;
                     }
 
-                    long backoffMs = (long) Math.pow(10, failedWrite.retryCount + 1) * 1000;
+                    // Exponential backoff: 10s, 30s, 60s
+                    long backoffMs;
+                    if (failedWrite.retryCount == 0) {
+                        backoffMs = 10 * 1000; // 10 seconds
+                    } else if (failedWrite.retryCount == 1) {
+                        backoffMs = 30 * 1000; // 30 seconds
+                    } else {
+                        backoffMs = 60 * 1000; // 60 seconds
+                    }
+
                     long timeSinceFailure = System.currentTimeMillis() - failedWrite.timestamp;
+                    long remainingBackoffMs = backoffMs - timeSinceFailure;
 
                     if (timeSinceFailure < backoffMs) {
                         deadLetterQueue.offer(failedWrite);
-                        Thread.sleep(1000);
+                        Thread.sleep(Math.min(remainingBackoffMs, 5000));
                         continue;
                     }
 
@@ -261,10 +253,6 @@ public class HdfsTierMetadataCapture {
      * THREAD-SAFETY: Can be called concurrently from multiple flush/compaction threads.
      * BufferedMutator handles synchronization internally.
      *
-     * RACE CONDITION HANDLING:
-     * - Composite row key (regionEncodedName + hfileName + timestamp) ensures uniqueness
-     * - Region-scoped tracking matches HBase's internal HFile management
-     *
      * PATH HANDLING:
      * - hfilePath: Original HFile path on disk (used for metadata extraction like size, column family)
      * - hdfsHfilePath: Path where HFile will be stored in HDFS hbase_cache directory
@@ -273,7 +261,7 @@ public class HdfsTierMetadataCapture {
      * @param storeFile StoreFile reference containing HFile metadata
      * @param region Region containing this file
      * @param hfilePath Original HFile path on disk (for metadata extraction)
-     * @param hdfsHfilePath Path in HDFS hbase_cache directory (stored in COL_PATH for future use)
+     * @param hdfsHfilePath Path in HDFS hbase_cache directory
      */
     public void captureHFileMetadata(StoreFile storeFile, Region region, Path hfilePath, Path hdfsHfilePath)
             throws IOException {
@@ -292,6 +280,7 @@ public class HdfsTierMetadataCapture {
             // EXTRACT COLUMN FAMILY from file path structure
             // HFile path: .../namespace/table/region/columnfamily/hfilename
             // Column family is the parent directory name
+
             String colFamily = "";
             if (hfilePath.getParent() != null) {
                 colFamily = hfilePath.getParent().getName();
@@ -302,17 +291,16 @@ public class HdfsTierMetadataCapture {
 
             long createTime = System.currentTimeMillis();
 
-            // EXTRACT FILE SIZE: Use original hfilePath for size extraction
+            // Use original hfilePath for size extraction
             // StoreFile interface doesn't expose getReader(), but HStoreFile implementation does
             long size = 0;
             try {
-              // Primary: Try reader (no extra I/O)
+
               if (storeFile instanceof HStoreFile) {
                 HStoreFile hstoreFile = (HStoreFile) storeFile;
                 StoreFileReader reader = hstoreFile.getReader();
                 if (reader != null) {
                   size = reader.length();
-                  LOG.debug("Got size from reader: {} bytes", size);
                 }
               }
 
@@ -330,9 +318,8 @@ public class HdfsTierMetadataCapture {
               size = 0; // Safe default
             }
 
-            // ROW KEY: {regionEncodedName}#{hfileName}#{createTimestamp}
-            // This matches HBase's region-scoped HFile tracking
-            byte[] rowKey = HdfsTierMetaTable.createRowKey(encRegName, hfileName, createTime);
+            // ROW KEY: {regionEncodedName}#{hfileName}
+            byte[] rowKey = HdfsTierMetaTable.createRowKey(encRegName, hfileName);
 
             Put put = new Put(rowKey);
 
@@ -376,23 +363,10 @@ public class HdfsTierMetadataCapture {
                          HdfsTierMetaTable.COL_EVICTED,
                          Bytes.toBytes(false));
 
-            // HIGH-THROUGHPUT ASYNC WRITE using BufferedMutator
-            // - HBase internally batches multiple Puts into single RPC
-            //
-            // PERFORMANCE AT SCALE:
-            // - 2000+ calls/sec to this method → handled by buffer
-            // - Actual writes to metadata table: ~40-50 batched RPCs/sec
-            // - Flush latency impact: < 1ms (just queue operation)
-            // - Without BufferedMutator: 5-10ms per flush (synchronous write)
-            //
-            // CONSISTENCY GUARANTEE:
-            // - Writes are NOT immediately visible in metadata table
-            // - Auto-flush every 5 seconds ensures max 5s delay
-            // - Explicit flush on shutdown ensures no data loss
-            // - Dead-letter queue captures and retries failed writes
+
             bufferedMutator.mutate(put);
 
-            LOG.debug("Captured: region={}, file={}, path={}", encRegName, hfileName, hdfsHfilePath);
+            LOG.debug("Captured: region={}, file={}", encRegName, hfileName);
 
         } catch (Exception e) {
             LOG.error("Capture failed for {}: {}", hfilePath.getName(), e.getMessage());
@@ -412,23 +386,24 @@ public class HdfsTierMetadataCapture {
      * The physical file still exists in cache but is logically obsolete.
      *
      * @param regionEncodedName Encoded region name to identify correct row
-     * @param hfileName Name of the HFile being compacted (without timestamp)
-     * @param createTimestamp Creation timestamp to identify exact row
+     * @param hfileName Name of the HFile being compacted
+     * @param createTimestamp Creation timestamp
      */
     public void updateFileStateToCompacted(String regionEncodedName, String hfileName, long createTimestamp) {
         asyncExecutor.submit(() -> {
             try {
-                updateFileStateSync(regionEncodedName, hfileName, createTimestamp, "COMPACTED");
+                updateFileStateSync(regionEncodedName, hfileName, "COMPACTED");
             } catch (Exception e) {
-                LOG.error("Async task failed for {}#{}, adding to retry queue", hfileName, createTimestamp);
+                LOG.error("Async task failed for {}#{}, adding to retry queue", hfileName, regionEncodedName);
 
-                // Add to dead-letter queue for retry
+                // forms failedWrite and offers to dead-letter queue
                 try {
-                    byte[] rowKey = HdfsTierMetaTable.createRowKey(regionEncodedName, hfileName, createTimestamp);
+                    byte[] rowKey = HdfsTierMetaTable.createRowKey(regionEncodedName, hfileName);
+                    String rowKeyStr = Bytes.toString(rowKey);
 
+                    // Reconstruct the Put that failed
                     Put put = new Put(rowKey);
                     long transTime = System.currentTimeMillis();
-
                     put.addColumn(HdfsTierMetaTable.CF_TRANSITION,
                                  HdfsTierMetaTable.COL_CURR_STATE,
                                  Bytes.toBytes("COMPACTED"));
@@ -436,7 +411,7 @@ public class HdfsTierMetadataCapture {
                                  HdfsTierMetaTable.COL_TRANS_TIME,
                                  Bytes.toBytes(transTime));
 
-                    FailedWrite failedWrite = new FailedWrite(put, Bytes.toString(rowKey), e);
+                    FailedWrite failedWrite = new FailedWrite(put, rowKeyStr, e);
 
                     if (!deadLetterQueue.offer(failedWrite)) {
                         LOG.error("Dead-letter queue full, cannot retry {}", hfileName);
@@ -450,58 +425,6 @@ public class HdfsTierMetadataCapture {
         });
     }
 
-    /**
-     * Updates state when HFile becomes referenced by child regions after split.
-     *
-     * THREAD-SAFETY: Can be called concurrently for different files.
-     * Uses async executor to prevent blocking caller's split thread.
-     *
-     * STATE TRANSITION: ACTIVE → SPLIT_REFERENCE
-     * This marks the parent HFile as now being referenced by child regions.
-     * The physical file remains on disk until ALL child regions compact away their references.
-     *
-     * @param regionEncodedName Parent region encoded name
-     * @param hfileName Parent HFile name
-     * @param createTimestamp Creation timestamp to identify exact row
-     */
-    public void updateFileStateToSplitReference(String regionEncodedName, String hfileName,
-                                                 long createTimestamp) {
-        asyncExecutor.submit(() -> {
-            try {
-                updateFileStateSync(regionEncodedName, hfileName, createTimestamp, "SPLIT_REFERENCE");
-            } catch (Exception e) {
-                LOG.error("Async task failed for split reference {}#{}, adding to retry queue",
-                         hfileName, createTimestamp);
-
-                // Add to dead-letter queue for retry
-                try {
-                    byte[] rowKey = HdfsTierMetaTable.createRowKey(regionEncodedName, hfileName,
-                                                                    createTimestamp);
-
-                    Put put = new Put(rowKey);
-                    long transTime = System.currentTimeMillis();
-
-                    put.addColumn(HdfsTierMetaTable.CF_TRANSITION,
-                                 HdfsTierMetaTable.COL_CURR_STATE,
-                                 Bytes.toBytes("SPLIT_REFERENCE"));
-                    put.addColumn(HdfsTierMetaTable.CF_TRANSITION,
-                                 HdfsTierMetaTable.COL_TRANS_TIME,
-                                 Bytes.toBytes(transTime));
-
-                    FailedWrite failedWrite = new FailedWrite(put, Bytes.toString(rowKey), e);
-
-                    if (!deadLetterQueue.offer(failedWrite)) {
-                        LOG.error("Dead-letter queue full, cannot retry {}", hfileName);
-                    } else {
-                        totalFailures.incrementAndGet();
-                    }
-                } catch (Exception retryQueueError) {
-                    LOG.error("Failed to queue retry for split reference {}: {}",
-                             hfileName, retryQueueError.getMessage());
-                }
-            }
-        });
-    }
 
     /**
      * Updates state when HFile is evicted from cache (ACTIVE → EVICTED).
@@ -509,20 +432,19 @@ public class HdfsTierMetadataCapture {
      * THREAD-SAFETY: Can be called concurrently from eviction service.
      * Uses BufferedMutator for batched async writes.
      *
-     * STATE TRANSITION: ACTIVE → EVICTED
+     * STATE TRANSITION: ACTIVE → EVICTED.
      * This marks the HFile as evicted from hbase_cache directory.
      * The row remains in metadata table for audit/history purposes.
      *
      * @param regionEncodedName Encoded region name to identify correct row
      * @param hfileName Name of the evicted HFile
-     * @param createTimestamp Creation timestamp to identify exact row
+     * @param createTimestamp Creation timestamp
      * @throws IOException If update fails (caller should handle)
      */
     public void updateFileStateToEvicted(String regionEncodedName, String hfileName, long createTimestamp) throws IOException {
-        // SYNCHRONOUS for eviction: Caller needs to know if marking succeeded
         // Eviction service can retry on failure
 
-        byte[] rowKey = HdfsTierMetaTable.createRowKey(regionEncodedName, hfileName, createTimestamp);
+        byte[] rowKey = HdfsTierMetaTable.createRowKey(regionEncodedName, hfileName);
 
         try {
             Put put = new Put(rowKey);
@@ -536,7 +458,7 @@ public class HdfsTierMetadataCapture {
                          HdfsTierMetaTable.COL_TRANS_TIME,
                          Bytes.toBytes(evictTime));
 
-            // Mark evicted flag (redundant with state, but explicit for queries)
+            // Mark evicted flag
             put.addColumn(HdfsTierMetaTable.CF_TRANSITION,
                          HdfsTierMetaTable.COL_EVICTED,
                          Bytes.toBytes(true));
@@ -558,24 +480,24 @@ public class HdfsTierMetadataCapture {
     /**
      * Synchronous state update using exact row key.
      *
-     * CONCURRENCY: Uses direct Put with exact row key .
+     * CONCURRENCY:
+     * Uses direct Put with exact row key.
      * Multiple threads updating different rows won't conflict.
-     * Same row updated by multiple threads: last write wins (acceptable).
+     * Same row updated by multiple threads: last write wins.
      *
      * FAILURE HANDLING:
      * - Retries on transient failures (handled by HBase client)
      * - Logs permanent failures but doesn't crash caller
      *
      * @param regionEncodedName Encoded region name for row key
-     * @param hfileName HFile name (for logging)
-     * @param createTimestamp Creation timestamp to build row key
+     * @param hfileName HFile name
      * @param newState New state value (COMPACTED, EVICTED, etc.)
      */
-    private void updateFileStateSync(String regionEncodedName, String hfileName, long createTimestamp, String newState)
+    private void updateFileStateSync(String regionEncodedName, String hfileName, String newState)
             throws IOException {
 
-        // Build exact row key: regionEncodedName#hfileName#timestamp
-        byte[] rowKey = HdfsTierMetaTable.createRowKey(regionEncodedName, hfileName, createTimestamp);
+        // Build row key: regionEncodedName#hfileName
+        byte[] rowKey = HdfsTierMetaTable.createRowKey(regionEncodedName, hfileName);
 
         try {
             Put put = new Put(rowKey);
@@ -592,277 +514,12 @@ public class HdfsTierMetadataCapture {
             // Use BufferedMutator for async batching
             bufferedMutator.mutate(put);
 
-            LOG.debug("Updated state: {}#{}#{} -> {}", regionEncodedName, hfileName, createTimestamp, newState);
+            LOG.debug("Updated state: {}#{} -> {}", regionEncodedName, hfileName,newState);
 
         } catch (Exception e) {
-            LOG.error("State update failed for {}#{}: {}", hfileName, createTimestamp, e.getMessage());
+            LOG.error("State update failed for {}#{}: {}", hfileName, regionEncodedName, e.getMessage());
             throw new IOException("State update failed", e);
         }
-    }
-
-    /**
-     * Query metadata table to get file's creation timestamp.
-     *
-     * WHY NEEDED: During compaction, we need timestamp to update the correct row.
-     * Row key format: {regionEncodedName}#{hfileName}#{timestamp}
-     *
-     * QUERY STRATEGY:
-     * - Scan with row prefix: {regionEncodedName}#{hfileName}#
-     * - Should return one row (unless duplicate captures occurred)
-     * - Extract timestamp from row key
-     *
-     * THREAD-SAFETY: Uses regular Table (thread-safe for reads)
-     *
-     * @param regionEncodedName Encoded region name
-     * @param hfileName HFile name
-     * @return Creation timestamp if found, null if not found
-     */
-    public Long getFileTimestamp(String regionEncodedName, String hfileName) {
-        try (Table metaTable = connection.getTable(HdfsTierMetaTable.TABLE_NAME)) {
-
-            // Build row prefix: {regionEncodedName}#{hfileName}#
-            String rowPrefix = regionEncodedName
-                + HdfsTierMetaTable.ROW_KEY_DELIMITER
-                + hfileName
-                + HdfsTierMetaTable.ROW_KEY_DELIMITER;
-
-            byte[] startRow = Bytes.toBytes(rowPrefix);
-
-            // Create exclusive stop row by incrementing last byte
-            byte[] stopRow = Bytes.toBytes(rowPrefix);
-            stopRow[stopRow.length - 1]++;
-
-            // Scan for matching rows
-            Scan scan = new Scan()
-                .withStartRow(startRow, true)
-                .withStopRow(stopRow, false)
-                .addFamily(HdfsTierMetaTable.CF_INFO)  // Only need to check row exists
-                .setLimit(1);  // We only need the first match
-
-            try (ResultScanner scanner = metaTable.getScanner(scan)) {
-                Result result = scanner.next();
-
-                if (result != null && !result.isEmpty()) {
-                    // Extract timestamp from row key
-                    String rowKey = Bytes.toString(result.getRow());
-                    String[] parts = HdfsTierMetaTable.parseRowKey(result.getRow());
-
-                    if (parts.length >= 3) {
-                        // parts[0] = regionEncodedName
-                        // parts[1] = hfileName
-                        // parts[2] = timestamp
-                        return Long.parseLong(parts[2]);
-                    }
-                }
-            }
-
-            // No matching row found
-            LOG.debug("No metadata for region={}, file={}", regionEncodedName, hfileName);
-            return null;
-
-        } catch (IOException e) {
-            LOG.error("Query failed for region={}, file={}: {}", regionEncodedName, hfileName, e.getMessage());
-            return null;
-        } catch (NumberFormatException e) {
-            LOG.error("Invalid timestamp in rowKey for {}: {}", hfileName, e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * Batch mark multiple files as evicted (ACTIVE → EVICTED).
-     * More efficient than individual updateFileStateToEvicted() calls.
-     *
-     * BATCH OPTIMIZATION: Single BufferedMutator call for all files.
-     * THREAD-SAFETY: Can be called concurrently with other operations.
-     *
-     * USE CASE: Eviction service evicting multiple files at once.
-     *
-     * @param fileEntries List of [regionEncodedName, hfileName, createTimestamp] triplets
-     * @throws IOException If batch update fails
-     */
-    public void updateFileStateToEvictedBatch(List<String[]> fileEntries) throws IOException {
-        if (fileEntries == null || fileEntries.isEmpty()) {
-            LOG.warn("Empty batch eviction list");
-            return;
-        }
-
-        List<Put> puts = new ArrayList<>(fileEntries.size());
-        long evictTime = System.currentTimeMillis();
-        int successCount = 0;
-        int failCount = 0;
-
-        for (String[] entry : fileEntries) {
-            try {
-                // SAFE PARSING: Validate entry format [regionEncodedName, hfileName, timestamp]
-                if (entry == null || entry.length < 3) {
-                    LOG.warn("Invalid entry format: {}", entry != null ? java.util.Arrays.toString(entry) : "null");
-                    failCount++;
-                    continue;
-                }
-
-                String regionEncodedName = entry[0];
-                String hfileName = entry[1];
-                long createTimestamp = Long.parseLong(entry[2]);
-
-                byte[] rowKey = HdfsTierMetaTable.createRowKey(regionEncodedName, hfileName, createTimestamp);
-                Put put = new Put(rowKey);
-
-                // Update state to EVICTED
-                put.addColumn(HdfsTierMetaTable.CF_TRANSITION,
-                             HdfsTierMetaTable.COL_CURR_STATE,
-                             Bytes.toBytes("EVICTED"));
-                put.addColumn(HdfsTierMetaTable.CF_TRANSITION,
-                             HdfsTierMetaTable.COL_TRANS_TIME,
-                             Bytes.toBytes(evictTime));
-
-                // Mark evicted flag
-                put.addColumn(HdfsTierMetaTable.CF_TRANSITION,
-                             HdfsTierMetaTable.COL_EVICTED,
-                             Bytes.toBytes(true));
-                put.addColumn(HdfsTierMetaTable.CF_TRANSITION,
-                             HdfsTierMetaTable.COL_EVICT_TIME,
-                             Bytes.toBytes(evictTime));
-
-                puts.add(put);
-                successCount++;
-
-            } catch (NumberFormatException e) {
-                LOG.error("Invalid timestamp: {}", entry[2]);
-                failCount++;
-            } catch (Exception e) {
-                LOG.error("Batch eviction prep failed: {}", java.util.Arrays.toString(entry));
-                failCount++;
-            }
-        }
-
-        // BATCH WRITE: Single mutate call for all valid entries
-        if (!puts.isEmpty()) {
-            try {
-                bufferedMutator.mutate(puts);
-                LOG.info("Batch marked {} EVICTED (success: {}, failed: {})", puts.size(), successCount, failCount);
-            } catch (IOException e) {
-                LOG.error("Batch eviction failed: {}", e.getMessage());
-                throw e;
-            }
-        } else {
-            LOG.warn("No valid entries in batch eviction");
-        }
-    }
-
-     /**
-     * Records reference file mapping: child region → parent HFile.
-     * Used during region split to track which parent HFiles are referenced by child regions.
-     *
-     * SCHEMA: Row: childRegion#refFile, CF: ref, Qualifier: parent_info
-     * Value: parentRegion:parentFile
-     *
-     * THREAD-SAFETY: Uses BufferedMutator for async writes
-     *
-     * @param childRegion Child region encoded name
-     * @param parentRegion Parent region encoded name
-     * @param parentFile Parent HFile name
-     * @param refFile Reference file name
-     */
-    public void recordReferenceFile(String childRegion, String parentRegion,
-                                      String parentFile, String refFile) {
-        try {
-            // Store reference mapping in metadata table
-            // Row key: childRegion#refFile (unique identifier for the reference)
-            String rowKeyStr = childRegion + HdfsTierMetaTable.ROW_KEY_DELIMITER + refFile;
-            byte[] rowKey = Bytes.toBytes(rowKeyStr);
-
-            Put put = new Put(rowKey);
-
-            // Store parent region and file info
-            String parentInfo = parentRegion + ":" + parentFile;
-            put.addColumn(Bytes.toBytes("ref"), Bytes.toBytes("parent_info"),
-                         Bytes.toBytes(parentInfo));
-            put.addColumn(Bytes.toBytes("ref"), Bytes.toBytes("timestamp"),
-                         Bytes.toBytes(System.currentTimeMillis()));
-
-            bufferedMutator.mutate(put);
-
-            LOG.info("Recorded reference: child={}, ref={}, parent_region={}, parent_file={}",
-                     childRegion, refFile, parentRegion, parentFile);
-
-        } catch (Exception e) {
-            LOG.error("Failed to record reference file: child={}, ref={}, parent={}",
-                     childRegion, refFile, parentFile, e);
-        }
-    }
-
-    /**
-     * Gets parent region name for a reference file.
-     *
-     * @param childRegion Child region encoded name
-     * @param refFile Reference file name
-     * @return Parent region encoded name, or null if not found
-     */
-    public String getParentRegionForReference(String childRegion, String refFile) {
-        try (Table metaTable = connection.getTable(HdfsTierMetaTable.TABLE_NAME)) {
-            String rowKeyStr = childRegion + HdfsTierMetaTable.ROW_KEY_DELIMITER + refFile;
-            byte[] rowKey = Bytes.toBytes(rowKeyStr);
-
-            Get get = new Get(rowKey);
-            get.addColumn(Bytes.toBytes("ref"), Bytes.toBytes("parent_info"));
-
-            Result result = metaTable.get(get);
-            if (result != null && !result.isEmpty()) {
-                byte[] parentInfo = result.getValue(Bytes.toBytes("ref"),
-                                                     Bytes.toBytes("parent_info"));
-                if (parentInfo != null) {
-                    String parentInfoStr = Bytes.toString(parentInfo);
-                    // Format: "parentRegion:parentFile"
-                    String[] parts = parentInfoStr.split(":");
-                    if (parts.length >= 1) {
-                        return parts[0]; // Return parent region
-                    }
-                }
-            }
-
-            LOG.debug("No parent region found for reference: child={}, ref={}",
-                     childRegion, refFile);
-            return null;
-
-        } catch (IOException e) {
-            LOG.error("Failed to get parent region for reference: child={}, ref={}",
-                     childRegion, refFile, e);
-            return null;
-        }
-    }
-
-    /**
-     * Removes reference file record after it's compacted away.
-     *
-     * @param childRegion Child region encoded name
-     * @param refFile Reference file name
-     */
-    public void removeReferenceFile(String childRegion, String refFile) {
-        try (Table metaTable = connection.getTable(HdfsTierMetaTable.TABLE_NAME)) {
-            String rowKeyStr = childRegion + HdfsTierMetaTable.ROW_KEY_DELIMITER + refFile;
-            byte[] rowKey = Bytes.toBytes(rowKeyStr);
-
-            Delete delete = new Delete(rowKey);
-            metaTable.delete(delete);
-
-            LOG.info("Removed reference record: child={}, ref={}", childRegion, refFile);
-
-        } catch (IOException e) {
-            LOG.error("Failed to remove reference file: child={}, ref={}",
-                     childRegion, refFile, e);
-        }
-    }
-
-    /**
-     * Submits a task to async executor for non-blocking execution.
-     * Used by observer to prevent blocking RegionServer threads.
-     *
-     * @param task Runnable to execute asynchronously
-     * @return Future for timeout control
-     */
-    public Future<?> submitAsync(Runnable task) {
-        return asyncExecutor.submit(task);
     }
 
     /**

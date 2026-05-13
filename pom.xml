@@ -823,6 +823,7 @@
     <module>hbase-extensions</module>
     <module>hbase-dev-generate-classpath</module>
     <module>hbase-website</module>
+    <module>hbase_cache</module>
   </modules>
   <scm>
     <connection>scm:git:git://gitbox.apache.org/repos/asf/hbase.git</connection>

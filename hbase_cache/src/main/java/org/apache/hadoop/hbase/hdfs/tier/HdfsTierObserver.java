@@ -4,6 +4,9 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.CoprocessorEnvironment;
 import org.apache.hadoop.hbase.coprocessor.*;
+import org.apache.hadoop.hbase.hdfs.tier.access.StoreFileScannerAccessTracker;
+import org.apache.hadoop.hbase.hdfs.tier.eviction.HDFSTierEvictionChoreService;
+import org.apache.hadoop.hbase.hdfs.tier.eviction.HDFSTierEvictionCoordinator;
 import org.apache.hadoop.hbase.regionserver.*;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionLifeCycleTracker;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionRequest;
@@ -25,6 +28,8 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
   private Configuration conf;
   private HdfsTierStorageMonitor storageMonitor;
   private HdfsTierMetricsServer metricsServer;
+  private HDFSTierEvictionCoordinator evictionCoordinator;
+  private HDFSTierEvictionChoreService evictionChoreService;
 
   @Override
   public Optional<RegionObserver> getRegionObserver() {
@@ -42,8 +47,37 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
     try {
       this.metadataCapture = new HdfsTierMetadataCapture(conf);
 
+      // Initialize HFile access tracking system
+      try {
+        StoreFileScannerAccessTracker.initialize(conf);
+        LOG.info("HFile access tracking initialized successfully");
+      } catch (Exception e) {
+        LOG.error("Failed to initialize HFile access tracking: {}", e.getMessage(), e);
+      }
+
       // Initialize storage monitor singleton
       this.storageMonitor = HdfsTierStorageMonitor.getInstance(conf);
+
+      // Initialize eviction coordinator
+      try {
+        this.evictionCoordinator = new HDFSTierEvictionCoordinator(conf, storageMonitor, metadataCapture);
+        LOG.info("HDFSTier Eviction Coordinator initialized successfully");
+      } catch (Exception e) {
+        LOG.error("Failed to initialize eviction coordinator: {}", e.getMessage(), e);
+        this.evictionCoordinator = null;
+      }
+
+      // Initialize and start eviction chore service (handles periodic eviction checks)
+      if (this.evictionCoordinator != null) {
+        try {
+          this.evictionChoreService = new HDFSTierEvictionChoreService(conf, storageMonitor, evictionCoordinator);
+          this.evictionChoreService.start();
+          LOG.info("HDFSTier Eviction Chore Service started successfully");
+        } catch (Exception e) {
+          LOG.error("Failed to start eviction chore service: {}", e.getMessage(), e);
+          this.evictionChoreService = null;
+        }
+      }
 
       // Start metrics HTTP server (only once, shared across all regions)
       synchronized (HdfsTierObserver.class) {
@@ -52,7 +86,7 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
             this.metricsServer = new HdfsTierMetricsServer(conf, storageMonitor);
             LOG.info("HdfsTier Metrics Server started successfully");
           } catch (IOException e) {
-            LOG.warn("Failed to start metrics server: {}. Metrics will not be available via HTTP.",
+            LOG.warn("Failed to start metrics server: {}.",
               e.getMessage());
             this.metricsServer = null;
           }
@@ -61,7 +95,7 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
 
       LOG.info("HdfsTierObserver started successfully");
     } catch (Exception e) {
-      LOG.warn("Failed to initialize HdfsTierObserver: {}. Will retry on first flush.",
+      LOG.warn("Failed to initialize HdfsTierObserver: {}.",
         e.getMessage() != null ? e.getMessage() : e.getClass().getName());
       this.metadataCapture = null;
     }
@@ -74,6 +108,33 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
   @Override
   public void stop(CoprocessorEnvironment env) throws IOException {
     LOG.info("HdfsTierObserver stopping");
+    // Shutdown HFile access tracking
+    try {
+      StoreFileScannerAccessTracker.shutdown();
+      LOG.info("HFile access tracking shut down successfully");
+    } catch (Exception e) {
+      LOG.error("Error shutting down access tracking: {}", e.getMessage(), e);
+    }
+
+    // Shutdown eviction chore service
+    if (evictionChoreService != null) {
+      try {
+        evictionChoreService.stop("HdfsTierObserver stopping");
+        LOG.info("HDFSTier Eviction Chore Service stopped successfully");
+      } catch (Exception e) {
+        LOG.error("Error stopping eviction chore service: {}", e.getMessage(), e);
+      }
+    }
+
+    // Shutdown eviction coordinator
+    if (evictionCoordinator != null) {
+      try {
+        evictionCoordinator.shutdown();
+        LOG.info("HDFSTier Eviction Coordinator shut down successfully");
+      } catch (Exception e) {
+        LOG.error("Error shutting down eviction coordinator: {}", e.getMessage(), e);
+      }
+    }
 
     // Stop metrics server
     if (metricsServer != null) {
@@ -123,7 +184,7 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
 
   /**
    * Internal method to capture metadata for flushed HFiles.
-   * Lazy-initializes metadata capture if it failed during start().
+   * Captures regular HFiles - reference files are ignored (handled during compaction).
    */
   private void captureFlushMetadata(ObserverContext<? extends RegionCoprocessorEnvironment> ctx)
     throws IOException {
@@ -150,7 +211,7 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
         return;
       }
 
-      // Skip system tables to avoid capturing system metadata
+      // Skip system tables
       String tableName = region.getTableDescriptor().getTableName().getNameAsString();
       if (tableName.startsWith("hbase:") || tableName.contains("hdfsTier:meta")) {
         LOG.debug("Skipping system table: {}", tableName);
@@ -159,7 +220,7 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
 
       String regionEncodedName = region.getRegionInfo().getEncodedName();
 
-      // Iterate through all stores (column families) in this region
+      // Iterate through all stores (column families)
       for (Store store : region.getStores()) {
         if (store == null) {
           continue;
@@ -170,57 +231,27 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
           try {
             Path originalFilePath = storeFile.getPath();
             if (originalFilePath == null) {
-              LOG.warn("StoreFile path is null, skipping metadata capture");
+              LOG.warn("StoreFile path is null, skipping");
               continue;
             }
 
-            // Check if this is a reference file (from split regions)
             if (storeFile.isReference()) {
-              // This is a reference file in a child region after split
-              // Track the reference mapping for later compaction handling
-              String refFileName = originalFilePath.getName();
-              String parentFileName = refFileName.replace(".Reference", "");
-
-              // Extract parent region from reference file name structure
-              // Reference file format: parentFile.parentRegionEncoded
-              String parentRegionName = extractParentRegionFromReference(storeFile);
-
-              if (parentRegionName != null) {
-                metadataCapture.recordReferenceFile(
-                  regionEncodedName,
-                  parentRegionName,
-                  parentFileName,
-                  refFileName
-                );
-                LOG.info("📝 Detected reference file during flush: child={}, ref={}, parent_region={}, parent_file={}",
-                         regionEncodedName, refFileName, parentRegionName, parentFileName);
-              } else {
-                LOG.warn("⚠️ Could not extract parent region for reference: {}", refFileName);
-              }
-
-              // Skip capturing metadata for reference files
-              // They don't represent actual data in our cache layer
+              LOG.debug("Skipping reference file during flush: {}", originalFilePath.getName());
               continue;
             }
 
-            // Regular HFile (not a reference) - capture metadata
-            // HDFS CACHE PATH: Placeholder for future HDFS cache directory
-            // Later implementation will copy the file to this path
-            String hdfsCachePath = "hdfs://placeholder/hbase_cache/" +
-              originalFilePath.getName();
-
-            // Convert String to Path for method signature consistency
+            // Regular HFile - capture metadata
+            String hdfsCachePath = "hdfs://hbase_cache/" + originalFilePath.getName();
             Path hdfsPath = new Path(hdfsCachePath);
 
-            // Capture metadata with both original and HDFS cache paths
             metadataCapture.captureHFileMetadata(
               storeFile,
               region,
-              originalFilePath,  // Source path for reading file properties
-              hdfsPath          // Future HDFS cache path for storage
+              originalFilePath,
+              hdfsPath
             );
 
-            // Record flush in storage monitor for real-time metrics
+            // Record flush in storage monitor
             if (storageMonitor != null) {
               long fileSize = 0;
               try {
@@ -239,7 +270,7 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
               }
             }
 
-            LOG.debug("Captured metadata for flushed file: {} in region {}",
+            LOG.debug(" Captured flush metadata: {} in region {}",
               originalFilePath.getName(), regionEncodedName);
           } catch (Exception e) {
             LOG.error("Failed to capture metadata for store file {}: {}",
@@ -254,7 +285,12 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
 
   /**
    * Called after a compaction completes.
-   * Updates state of old files to COMPACTED and captures metadata for new compacted file.
+   * EVENT-AGNOSTIC: Handles regular compaction, split reference compaction, and merge reference compaction uniformly.
+   *
+   * Actions:
+   * 1. Mark old input files as COMPACTED
+   * 2. Capture metadata for new compacted output file
+   * 3. Update storage monitor (remove old sizes, add new size)
    */
   @Override
   public void postCompact(ObserverContext<? extends RegionCoprocessorEnvironment> ctx,
@@ -262,10 +298,9 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
     StoreFile resultFile,
     CompactionLifeCycleTracker tracker,
     CompactionRequest request) throws IOException {
-    LOG.info("🔄 postCompact CALLED - store={}, resultFile={}, request={}",
+    LOG.info(" postCompact triggered - store={}, resultFile={}",
              store != null ? store.getColumnFamilyName() : "null",
-             resultFile != null ? resultFile.getPath() : "null",
-             request != null ? "present" : "null");
+             resultFile != null ? resultFile.getPath().getName() : "null");
     try {
       captureCompactionMetadata(ctx, store, resultFile, request);
     } catch (Exception e) {
@@ -274,8 +309,11 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
   }
 
   /**
-   * Internal method to capture compaction metadata.
-   * Marks input files as COMPACTED and captures metadata for output file.
+   * EVENT-AGNOSTIC compaction handler.
+   * Works uniformly for:
+   * - Regular compaction: Marks regular HFiles as COMPACTED
+   * - Split compaction: Marks parent region's HFiles as COMPACTED (via reference detection)
+   * - Merge compaction: Marks multiple parent regions' HFiles as COMPACTED (via reference detection)
    */
   private void captureCompactionMetadata(
     ObserverContext<? extends RegionCoprocessorEnvironment> ctx,
@@ -283,17 +321,15 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
     StoreFile resultFile,
     CompactionRequest request) throws IOException {
 
-
-    // Lazy initialization: retry if start() failed
+    // Lazy initialization
     if (metadataCapture == null) {
       synchronized (this) {
         if (metadataCapture == null) {
           try {
-            LOG.info("Lazy-initializing HdfsTierMetadataCapture on first compaction");
+            LOG.info("initializing HdfsTierMetadataCapture");
             this.metadataCapture = new HdfsTierMetadataCapture(conf);
           } catch (Exception e) {
-            LOG.error("Failed to initialize metadata capture: {}. Skipping.",
-              e.getMessage() != null ? e.getMessage() : e.getClass().getName());
+            LOG.error("Failed to initialize metadata capture: {}. Skipping.", e.getMessage());
             return;
           }
         }
@@ -303,428 +339,183 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
     try {
       Region region = ctx.getEnvironment().getRegion();
       if (region == null) {
-        LOG.warn("Region is null in postCompact callback");
+        LOG.warn("Region is null in postCompact");
         return;
       }
 
-      // Skip system tables to avoid capturing system metadata
+      // Skip system tables
       String tableName = region.getTableDescriptor().getTableName().getNameAsString();
       if (tableName.startsWith("hbase:") || tableName.contains("hdfsTier:meta")) {
-        LOG.debug("Skipping system table: {}", tableName);
         return;
       }
 
-      LOG.info("📋 Processing compaction for table: {}", tableName);
+      String currentRegionName = region.getRegionInfo().getEncodedName();
+      LOG.info("Compaction in region: {}, table: {}", currentRegionName, tableName);
 
-      String regionEncodedName = region.getRegionInfo().getEncodedName();
-
-      // Get parent files - try multiple sources
-      java.util.Collection<? extends StoreFile> parentFiles = null;
-
+      // Get input files being compacted
+      java.util.Collection<? extends StoreFile> inputFiles = null;
       if (request != null && request.getFiles() != null && !request.getFiles().isEmpty()) {
-        parentFiles = request.getFiles();
-        LOG.info("✅ Got {} parent files from CompactionRequest", parentFiles.size());
+        inputFiles = request.getFiles();
       } else {
-        // Fallback: try to get from store's compacted files
         try {
-          parentFiles = store.getCompactedFiles();
-          if (parentFiles != null && !parentFiles.isEmpty()) {
-            LOG.info("✅ Got {} parent files from store.getCompactedFiles()", parentFiles.size());
-          } else {
-            LOG.warn("⚠️ No parent files found in request or store.getCompactedFiles()");
-          }
+          inputFiles = store.getCompactedFiles();
         } catch (Exception e) {
-          LOG.warn("Failed to get compacted files from store: {}", e.getMessage());
+          LOG.warn("Failed to get compacted files: {}", e.getMessage());
         }
       }
 
-      // Calculate total size of parent files for storage monitor
-      long totalParentSize = 0;
-      int parentFileCount = 0;
+      if (inputFiles == null || inputFiles.isEmpty()) {
+        LOG.warn("No input files found for compaction");
+        return;
+      }
 
-      if (parentFiles != null && !parentFiles.isEmpty()) {
-        for (StoreFile oldFile : parentFiles) {
+      LOG.info("Processing {} input files", inputFiles.size());
+
+      // Track total size removed from storage
+      long totalSizeRemoved = 0;
+
+      // Process each input file
+      for (StoreFile inputFile : inputFiles) {
+        try {
+          Path inputPath = inputFile.getPath();
+          String inputFileName = inputPath.getName();
+
+          // Get file size for storage tracking
+          long fileSize = 0;
           try {
-            long fileSize = 0;
-            if (oldFile instanceof HStoreFile) {
-              HStoreFile hstoreFile = (HStoreFile) oldFile;
-              StoreFileReader reader = hstoreFile.getReader();
+            if (inputFile instanceof HStoreFile) {
+              StoreFileReader reader = ((HStoreFile) inputFile).getReader();
               if (reader != null) {
                 fileSize = reader.length();
-                totalParentSize += fileSize;
-                parentFileCount++;
+                totalSizeRemoved += fileSize;
               }
             }
-            LOG.info("  📄 Parent file: {}, size: {} bytes",
-                     oldFile.getPath().getName(), fileSize);
           } catch (Exception e) {
-            LOG.warn("Failed to get size for parent file {}: {}",
-              oldFile.getPath(), e.getMessage());
+            LOG.warn("Failed to get size for file {}: {}", inputFileName, e.getMessage());
           }
-        }
-        LOG.info("📊 Total parent files: {}, Total size: {} bytes ({} MB)",
-                 parentFileCount, totalParentSize, totalParentSize / (1024.0 * 1024));
-      }
 
-      // Mark old input files as COMPACTED
-      if (parentFiles != null && !parentFiles.isEmpty()) {
-        for (StoreFile oldFile : parentFiles) {
-          try {
-            Path oldFilePath = oldFile.getPath();
-            String oldFileName = oldFilePath.getName();
+          // CASE 1: Regular HFile compaction
+          if (!inputFile.isReference()) {
+            // Row key: {currentRegionName}#{inputFileName}
+            metadataCapture.updateFileStateToCompacted(
+              currentRegionName,
+              inputFileName,
+              0L  // timestamp not used for row key lookup
+            );
+            LOG.info("Regular HFile → COMPACTED: {} in region {} (size: {} bytes)",
+                     inputFileName, currentRegionName, fileSize);
+          }
+          // CASE 2: Reference file compaction (from split or merge)
+          else {
+            String parentFileName = extractParentFileNameFromReference(inputFileName);
+            String parentRegionName = extractParentRegionFromReference(inputFile);
 
-            // Check if this is a reference file
-            if (oldFile.isReference()) {
-              // This is a reference file being compacted away
-              // Remove ".Reference" suffix to get actual parent HFile name
-              String parentFileName = oldFileName.replace(".Reference", "");
-
-              // Get the parent region name from our reference tracking metadata
-              String parentRegionName = metadataCapture.getParentRegionForReference(
-                regionEncodedName,
-                oldFileName
+            if (parentRegionName != null && parentFileName != null) {
+              // Row key: {parentRegionName}#{parentFileName}
+              metadataCapture.updateFileStateToCompacted(
+                parentRegionName,
+                parentFileName,
+                0L  // timestamp not used for row key lookup
               );
-
-              if (parentRegionName != null) {
-                // Query for the parent file's creation timestamp
-                Long parentTimestamp = metadataCapture.getFileTimestamp(
-                  parentRegionName,
-                  parentFileName
-                );
-
-                if (parentTimestamp != null) {
-                  // Mark the ACTUAL parent HFile as compacted in parent region
-                  metadataCapture.updateFileStateToCompacted(
-                    parentRegionName,      // Parent region (correct!)
-                    parentFileName,        // Actual HFile name (correct!)
-                    parentTimestamp        // Parent file's timestamp
-                  );
-
-                  LOG.info("✅ Marked parent HFile as COMPACTED via reference: " +
-                      "parent_region={}, parent_file={}, parent_ts={}, child_region={}, ref_file={}",
-                    parentRegionName, parentFileName, parentTimestamp, regionEncodedName, oldFileName);
-                } else {
-                  LOG.warn("⚠️ Could not find timestamp for parent file: region={}, file={}",
-                           parentRegionName, parentFileName);
-                }
-              } else {
-                LOG.warn("⚠️ No parent region mapping found for reference: child={}, ref={}",
-                         regionEncodedName, oldFileName);
-              }
-
-              // Remove the reference file record after marking parent as compacted
-              metadataCapture.removeReferenceFile(regionEncodedName, oldFileName);
-
+              LOG.info("Reference HFile → Parent COMPACTED: {} in region {}",
+                       parentFileName, parentRegionName);
             } else {
-              // Regular HFile compaction - get timestamp for this file
-              Long fileTimestamp = metadataCapture.getFileTimestamp(
-                regionEncodedName,
-                oldFileName
-              );
-
-              if (fileTimestamp != null) {
-                metadataCapture.updateFileStateToCompacted(
-                  regionEncodedName,
-                  oldFileName,
-                  fileTimestamp
-                );
-
-                LOG.info("✅ Marked HFile as COMPACTED: region={}, file={}, timestamp={}",
-                  regionEncodedName, oldFileName, fileTimestamp);
-              } else {
-                LOG.warn("⚠️ Could not find timestamp for file: region={}, file={}",
-                         regionEncodedName, oldFileName);
-              }
+              LOG.warn("Could not resolve parent for reference: {}", inputFileName);
             }
-          } catch (Exception e) {
-            LOG.error("Failed to mark old file as compacted: {}", oldFile.getPath(), e);
           }
+        } catch (Exception e) {
+          LOG.error("Failed to process input file {}: {}", inputFile.getPath(), e.getMessage());
         }
       }
 
-      // Capture metadata for new compacted output file
+      LOG.info("Total size removed: {} bytes ({} MB)",
+               totalSizeRemoved, totalSizeRemoved / (1024.0 * 1024));
+
+      // Capture metadata for NEW compacted output file
       if (resultFile != null) {
         try {
           Path newFilePath = resultFile.getPath();
-          LOG.info("📝 Capturing NEW compacted file: {}", newFilePath.getName());
+          String newFileName = newFilePath.getName();
 
-          // HDFS CACHE PATH: Placeholder for future HDFS cache directory
-          String hdfsCachePath = "hdfs://placeholder/hbase_cache/" +
-            newFilePath.getName();
+          // Result file is a HFile
+          if (resultFile.isReference()) {
+            LOG.warn("Result file is a reference (unexpected): {}", newFileName);
+          }
+
+          // HDFS cache path placeholder
+          String hdfsCachePath = "hdfs://hbase_cache/" + newFileName;
           Path hdfsPath = new Path(hdfsCachePath);
 
-          // Capture metadata for the newly created compacted file
+          // Capture metadata for new file
           metadataCapture.captureHFileMetadata(
             resultFile,
             region,
-            newFilePath,  // Original file path
-            hdfsPath      // HDFS cache path (placeholder)
+            newFilePath,
+            hdfsPath
           );
 
-          // Record compaction in storage monitor for real-time metrics
-          if (storageMonitor != null) {
-            long newFileSize = 0;
-            try {
-              if (resultFile instanceof HStoreFile) {
-                HStoreFile hstoreFile = (HStoreFile) resultFile;
-                StoreFileReader reader = hstoreFile.getReader();
-                if (reader != null) {
-                  newFileSize = reader.length();
-                }
+          // Get new file size
+          long newFileSize = 0;
+          try {
+            if (resultFile instanceof HStoreFile) {
+              StoreFileReader reader = ((HStoreFile) resultFile).getReader();
+              if (reader != null) {
+                newFileSize = reader.length();
               }
-              if (newFileSize > 0) {
-                storageMonitor.recordCompaction(
-                  newFilePath.getName(),
-                  newFileSize,
-                  totalParentSize
-                );
-                LOG.info("✅ StorageMonitor updated: new={} bytes, parent={} bytes, net={} bytes",
-                         newFileSize, totalParentSize, (newFileSize - totalParentSize));
-              }
-            } catch (Exception e) {
-              LOG.warn("Failed to record compaction in storage monitor: {}", e.getMessage());
             }
-          } else {
-            LOG.warn("⚠️ StorageMonitor is null - metrics not recorded");
+          } catch (Exception e) {
+            LOG.warn("Failed to get size for new file: {}", e.getMessage());
           }
 
-          LOG.info("✅ Captured metadata for new compacted file: {} in region {}",
-            newFilePath.getName(), regionEncodedName);
+          // Update storage monitor
+          if (storageMonitor != null && newFileSize > 0) {
+            storageMonitor.recordCompaction(newFileName, newFileSize, totalSizeRemoved);
+            LOG.info("StorageMonitor: added {} bytes, removed {} bytes, net change: {} bytes",
+                     newFileSize, totalSizeRemoved, (newFileSize - totalSizeRemoved));
+          }
+
+          LOG.info("New compacted file captured: {} (size: {} bytes)", newFileName, newFileSize);
+
         } catch (Exception e) {
-          LOG.error("❌ Failed to capture metadata for new compacted file: {}",
-            resultFile.getPath(), e);
-          e.printStackTrace();
+          LOG.error("Failed to capture new compacted file: {}", resultFile.getPath(), e);
         }
       } else {
-        LOG.warn("⚠️ ResultFile is null - no new compacted file to capture");
+        LOG.warn("Result file is null");
       }
 
-      LOG.info("📊 captureCompactionMetadata COMPLETE");
+      LOG.info("Compaction metadata capture complete");
 
     } catch (Exception e) {
-      LOG.error("❌ Unexpected error in compaction metadata capture: {}", e.getMessage(), e);
+      LOG.error("Unexpected error in compaction capture: {}", e.getMessage(), e);
     }
   }
 
   /**
-   * Called after region split completes on PARENT region.
-   * Marks parent HFiles as SPLIT_REFERENCE state since they are now referenced by child regions.
-   *
-   * NOTE: In HBase 4.0, split hooks are in MasterObserver, not RegionObserver.
-   * This method can be called manually or through custom split tracking mechanism.
-   *
-   * @param ctx Observer context
+   * Extracts parent HFile name from reference file name.
+   * Reference format: "parentFile.parentRegionEncoded" or "parentFile.Reference"
+   * Example: "abc123.def456789" → "abc123"
    */
-  public void postCompleteSplit(ObserverContext<RegionCoprocessorEnvironment> ctx)
-      throws IOException {
-
-    LOG.info("🔀 SPLIT EVENT: postCompleteSplit (Parent Region)");
-
-    // Lazy initialization
-    if (metadataCapture == null) {
-      synchronized (this) {
-        if (metadataCapture == null) {
-          try {
-            LOG.info("Lazy-initializing HdfsTierMetadataCapture for split tracking");
-            this.metadataCapture = new HdfsTierMetadataCapture(conf);
-          } catch (Exception e) {
-            LOG.error("Failed to initialize metadata capture: {}", e.getMessage());
-            return;
-          }
-        }
-      }
+  private String extractParentFileNameFromReference(String referenceFileName) {
+    if (referenceFileName == null) {
+      return null;
     }
 
-    try {
-      Region region = ctx.getEnvironment().getRegion();
-      if (region == null) {
-        LOG.warn("Region is null in postCompleteSplit");
-        return;
-      }
+    // Remove common reference suffixes
+    String cleaned = referenceFileName.replace(".Reference", "");
 
-      String parentRegionName = region.getRegionInfo().getEncodedName();
-      String tableName = region.getTableDescriptor().getTableName().getNameAsString();
-
-      // Skip system tables
-      if (tableName.startsWith("hbase:") || tableName.contains("hdfsTier:meta")) {
-        LOG.debug("Skipping system table split: {}", tableName);
-        return;
-      }
-
-      LOG.info("Parent region {} split completed for table {}", parentRegionName, tableName);
-
-      // Mark all parent HFiles as SPLIT_REFERENCE state
-      int markedCount = 0;
-      for (Store store : region.getStores()) {
-        String columnFamily = store.getColumnFamilyName();
-
-        for (StoreFile storeFile : store.getStorefiles()) {
-          try {
-            String hfileName = storeFile.getPath().getName();
-
-            // Get timestamp for this HFile
-            Long timestamp = metadataCapture.getFileTimestamp(parentRegionName, hfileName);
-
-            if (timestamp != null) {
-              // Mark as SPLIT_REFERENCE (parent file now referenced by children)
-              metadataCapture.updateFileStateToSplitReference(
-                parentRegionName,
-                hfileName,
-                timestamp
-              );
-              markedCount++;
-
-              LOG.info("✅ Marked parent HFile as SPLIT_REFERENCE: region={}, cf={}, file={}",
-                       parentRegionName, columnFamily, hfileName);
-            } else {
-              LOG.warn("⚠️ No timestamp found for parent HFile: {}", hfileName);
-            }
-          } catch (Exception e) {
-            LOG.error("Failed to mark parent HFile: {}", storeFile.getPath(), e);
-          }
-        }
-      }
-
-      LOG.info("✅ Marked {} parent HFiles as SPLIT_REFERENCE in region {}",
-               markedCount, parentRegionName);
-
-    } catch (Exception e) {
-      LOG.error("❌ Failed to track parent HFiles in postCompleteSplit: {}", e.getMessage(), e);
+    // Extract base file name (before last dot)
+    int lastDot = cleaned.lastIndexOf('.');
+    if (lastDot > 0) {
+      return cleaned.substring(0, lastDot);
     }
+
+    return cleaned;
   }
 
   /**
-   * Called on CHILD regions after split completes.
-   * Tracks reference files created in child regions and maps them to parent HFiles.
-   *
-   * NOTE: In HBase 4.0, split hooks are in MasterObserver, not RegionObserver.
-   * This method can be called manually or through custom split tracking mechanism.
-   *
-   * @param ctx Observer context
-   * @param leftChild Left child region (bottom key range)
-   * @param rightChild Right child region (top key range)
-   */
-  public void postSplit(ObserverContext<RegionCoprocessorEnvironment> ctx,
-                        Region leftChild, Region rightChild) throws IOException {
-
-    LOG.info("🔀 SPLIT EVENT: postSplit (Child Regions)");
-
-    // Lazy initialization
-    if (metadataCapture == null) {
-      synchronized (this) {
-        if (metadataCapture == null) {
-          try {
-            LOG.info("Lazy-initializing HdfsTierMetadataCapture for split tracking");
-            this.metadataCapture = new HdfsTierMetadataCapture(conf);
-          } catch (Exception e) {
-            LOG.error("Failed to initialize metadata capture: {}", e.getMessage());
-            return;
-          }
-        }
-      }
-    }
-
-    try {
-      String leftName = leftChild.getRegionInfo().getEncodedName();
-      String rightName = rightChild.getRegionInfo().getEncodedName();
-
-      LOG.info("Child regions created: left={}, right={}", leftName, rightName);
-
-      // Track reference files in both child regions
-      trackChildRegionReferences(leftChild);
-      trackChildRegionReferences(rightChild);
-
-      LOG.info("✅ Split tracking complete for children: left={}, right={}", leftName, rightName);
-
-    } catch (Exception e) {
-      LOG.error("❌ Failed to track child references in postSplit: {}", e.getMessage(), e);
-    }
-  }
-
-  /**
-   * Internal helper to track reference files in a child region after split.
-   * Creates mapping: child reference file → parent region/HFile
-   *
-   * @param child Child region created by split
-   */
-  private void trackChildRegionReferences(Region child) {
-    if (child == null) {
-      LOG.warn("Child region is null");
-      return;
-    }
-
-    String childRegionName = child.getRegionInfo().getEncodedName();
-    String tableName = child.getRegionInfo().getTable().getNameAsString();
-
-    // Skip system tables
-    if (tableName.startsWith("hbase:") || tableName.contains("hdfsTier:meta")) {
-      LOG.debug("Skipping system table: {}", tableName);
-      return;
-    }
-
-    LOG.info("🔍 Scanning child region {} for reference files", childRegionName);
-
-    int refCount = 0;
-    try {
-      // Iterate through all stores (column families) in child region
-      for (Store store : child.getStores()) {
-        if (store == null) {
-          continue;
-        }
-
-        String columnFamily = store.getColumnFamilyName();
-
-        // Check each StoreFile for references
-        for (StoreFile sf : store.getStorefiles()) {
-          if (sf.isReference()) {
-            try {
-              // Extract reference file information
-              String refFileName = sf.getPath().getName();
-              String parentFileName = refFileName.replace(".Reference", "");
-
-              // Get parent region from reference using HBase API
-              String parentRegionName = extractParentRegionFromReference(sf);
-
-              if (parentRegionName != null) {
-                // Record the reference mapping in metadata table
-                metadataCapture.recordReferenceFile(
-                  childRegionName,
-                  parentRegionName,
-                  parentFileName,
-                  refFileName
-                );
-                refCount++;
-
-                LOG.info("📝 Tracked reference: child={}, cf={}, parent_region={}, " +
-                         "parent_file={}, ref_file={}",
-                         childRegionName, columnFamily, parentRegionName,
-                         parentFileName, refFileName);
-              } else {
-                LOG.warn("⚠️ Could not determine parent region for reference: {}", refFileName);
-              }
-
-            } catch (Exception e) {
-              LOG.error("Failed to track reference file {}: {}", sf.getPath(), e.getMessage(), e);
-            }
-          }
-        }
-      }
-
-      LOG.info("✅ Tracked {} reference files in child region {}", refCount, childRegionName);
-
-    } catch (Exception e) {
-      LOG.error("Error scanning child region {} for references: {}",
-               childRegionName, e.getMessage(), e);
-    }
-  }
-
-  /**
-   * Extracts parent region name from a reference StoreFile.
-   * Reference file names have format: "parentFileName.parentRegionEncodedName"
-   * Example: "abc123.def456789abc" where "def456789abc" is the parent region encoded name
-   *
-   * @param storeFile Reference StoreFile
-   * @return Parent region encoded name, or null if cannot be determined
+   * Extracts parent region name from reference file.
+   * Reference file naming: "parentFileName.parentRegionEncoded"
+   * Example: "abc123.def456789abc" → "def456789abc" (parent region)
    */
   private String extractParentRegionFromReference(StoreFile storeFile) {
     try {
@@ -732,48 +523,97 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
         return null;
       }
 
-      // Reference file path structure:
-      // .../table/childRegion/cf/parentFile.parentRegionEncoded
-      // Example: .../mytable/abc123/cf/file001.def456789abc
-
       Path refPath = storeFile.getPath();
       String refFileName = refPath.getName();
 
-      // Reference file name format: "parentFileName.parentRegionEncodedName"
-      // We need to extract the parent region encoded name (part after last dot)
+      // Extract parent region encoded name
       int lastDot = refFileName.lastIndexOf('.');
       if (lastDot > 0 && lastDot < refFileName.length() - 1) {
         String parentRegionEncoded = refFileName.substring(lastDot + 1);
-
         LOG.debug("Extracted parent region: {} from reference: {}",
                  parentRegionEncoded, refFileName);
-
         return parentRegionEncoded;
       } else {
-        LOG.warn("Cannot parse parent region from reference file name: {}", refFileName);
+        LOG.warn("Cannot parse parent region from reference");
       }
-
     } catch (Exception e) {
       LOG.warn("Failed to extract parent region from reference {}: {}",
               storeFile.getPath(), e.getMessage());
     }
-
     return null;
   }
 
   /**
-   * Helper method to extract parent region name from a reference StoreFile.
-   * Reference files contain metadata about which region/file they reference.
-   *
-   * @param storeFile Reference StoreFile
-   * @return Parent region encoded name, or null if cannot be determined
-   * @deprecated Use extractParentRegionFromReference instead
+   * Called after a Get operation completes.
+   * Tracks access to HFiles for read tracking.
    */
-  private String extractParentRegionName(StoreFile storeFile) {
-    return extractParentRegionFromReference(storeFile);
+  @Override
+  public void postGetOp(ObserverContext<? extends RegionCoprocessorEnvironment> ctx,
+                        org.apache.hadoop.hbase.client.Get get,
+                        java.util.List<org.apache.hadoop.hbase.Cell> results) throws IOException {
+    trackRegionAccess(ctx);
+  }
+
+  /**
+   * Called before scanner is opened.
+   * Tracks access to HFiles for read tracking.
+   */
+  @Override
+  public void preScannerOpen(ObserverContext<? extends RegionCoprocessorEnvironment> ctx,
+                             org.apache.hadoop.hbase.client.Scan scan) throws IOException {
+    trackRegionAccess(ctx);
+  }
+
+  /**
+   * Tracks access to HFiles in the current region
+   * Called from Get and Scan operations to record HFile reads
+   */
+  private void trackRegionAccess(ObserverContext<? extends RegionCoprocessorEnvironment> ctx) {
+    try {
+      Region region = ctx.getEnvironment().getRegion();
+      if (region == null) {
+        return;
+      }
+
+      // Skip system tables
+      String tableName = region.getTableDescriptor().getTableName().getNameAsString();
+      if (tableName.startsWith("hbase:") || tableName.contains("hdfsTier:meta")) {
+        return;
+      }
+
+      // Track access for all store files in all column families
+      for (Store store : region.getStores()) {
+        if (store == null) {
+          continue;
+        }
+
+        for (StoreFile storeFile : store.getStorefiles()) {
+          if (storeFile == null) {
+            continue;
+          }
+
+          try {
+            // Cast to HStoreFile to access getReader()
+            if (storeFile instanceof HStoreFile) {
+              HStoreFile hstoreFile = (HStoreFile) storeFile;
+              StoreFileReader reader = hstoreFile.getReader();
+              if (reader != null) {
+                // Track this HFile access
+                StoreFileScannerAccessTracker.trackAccess(reader, (org.apache.hadoop.hbase.regionserver.HRegion) region);
+              }
+            }
+          } catch (Exception e) {
+            if (LOG.isDebugEnabled()) {
+              LOG.debug("Failed to track access for store file: {}", e.getMessage());
+            }
+          }
+        }
+      }
+    } catch (Exception e) {
+      // Fail silently
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Failed to track region access: {}", e.getMessage());
+      }
+    }
   }
 }
-
-
-
-
