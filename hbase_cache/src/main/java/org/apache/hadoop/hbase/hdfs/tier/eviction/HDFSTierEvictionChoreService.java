@@ -165,8 +165,8 @@ public class HDFSTierEvictionChoreService implements Stoppable {
 
       // Get threshold configuration
       double evictionThresholdPercent = conf.getDouble("hbase.hdfstier.eviction.threshold", 90.0);
-      long maxStorageBytes = conf.getLong("hbase.hdfstier.storage.max.bytes",
-                                          100L * 1024 * 1024 * 1024);
+      long maxStorageBytes = conf.getLong("hbase.hdfstier.max.storage.size",
+                                          1073741824L); // 1 GB default (1024*1024*1024)
 
       double usagePercent = (currentUsageBytes * 100.0) / maxStorageBytes;
 

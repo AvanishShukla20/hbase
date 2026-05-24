@@ -45,7 +45,7 @@ public class HdfsTierStorageMonitor {
 
   // Configuration key for max storage size
   private static final String CONFIG_KEY_MAX_STORAGE = "hbase.hdfstier.max.storage.size";
-  private static final long DEFAULT_MAX_STORAGE = 107374182400L; // 100 GB default
+  private static final long DEFAULT_MAX_STORAGE = 1073741824L; // 1 GB default (1024*1024*1024)
 
   // Configuration key for reconciliation interval (in minutes)
   private static final String CONFIG_KEY_RECONCILIATION_INTERVAL = "hbase.hdfstier.reconciliation.interval.minutes";
@@ -67,6 +67,12 @@ public class HdfsTierStorageMonitor {
   private volatile long lastFlushedHFileSize = 0;
   private volatile String lastFlushedHFileName = "";
   private volatile long lastFlushedTimestamp = 0;
+
+  // Track last eviction details for real-time display
+  private volatile int lastEvictionFilesCount = 0;
+  private volatile long lastEvictionBytesFreed = 0;
+  private volatile long lastEvictionTimestamp = 0;
+  private volatile String lastEvictedFilesNames = "";
 
   /**
    * Private constructor for singleton pattern.
@@ -211,6 +217,60 @@ public class HdfsTierStorageMonitor {
       netChange / (1024.0 * 1024),
       newTotal / (1024.0 * 1024),
       newCount);
+  }
+
+  /**
+   * Called when HFiles are evicted.
+   * Subtracts evicted file sizes from total storage.
+   *
+   * LOGIC:
+   * - Files marked as EVICTED in metadata table should not count toward storage
+   * - Reduce totalStorageUsed by the bytes that were evicted
+   * - Track eviction count for monitoring
+   *
+   * @param bytesEvicted Total size of evicted HFiles in bytes
+   * @param filesEvicted Number of files evicted
+   * @param evictedFileNames Comma-separated list of evicted file names (for display)
+   */
+  public void recordEviction(long bytesEvicted, int filesEvicted, String evictedFileNames) {
+    if (bytesEvicted <= 0) {
+      LOG.warn("Invalid eviction size: {} bytes", bytesEvicted);
+      return;
+    }
+
+    // Use compareAndSet loop for thread-safe atomic update
+    long currentTotal;
+    long newTotal;
+    do {
+      currentTotal = totalStorageUsed.get();
+      newTotal = currentTotal - bytesEvicted;
+
+      // Ensure we don't go negative
+      if (newTotal < 0) {
+        LOG.warn("Eviction would cause negative storage (current={} MB, evicting={} MB). " +
+                 "Clamping to 0. Reconciliation will fix drift.",
+          currentTotal / (1024.0 * 1024),
+          bytesEvicted / (1024.0 * 1024));
+        newTotal = 0;
+      }
+    } while (!totalStorageUsed.compareAndSet(currentTotal, newTotal));
+
+    // Update last eviction details for monitoring
+    this.lastEvictionFilesCount = filesEvicted;
+    this.lastEvictionBytesFreed = bytesEvicted;
+    this.lastEvictionTimestamp = System.currentTimeMillis();
+    this.lastEvictedFilesNames = evictedFileNames != null ? evictedFileNames : "";
+
+    // Calculate new utilization percentage
+    double utilizationPercent = (newTotal * 100.0) / totalAllocatedSize;
+
+    LOG.info("EVICTION: Files={}, BytesEvicted={} MB, " +
+        "RemainingStorage={} MB ({}% utilization), FileNames={}",
+      filesEvicted,
+      bytesEvicted / (1024.0 * 1024),
+      newTotal / (1024.0 * 1024),
+      String.format("%.2f", utilizationPercent),
+      evictedFileNames);
   }
 
   /**
@@ -387,7 +447,11 @@ public class HdfsTierStorageMonitor {
       lastFlushedHFileSize,
       lastFlushedTimestamp,
       lastReconciliationTime,
-      reconciliationInProgress.get()
+      reconciliationInProgress.get(),
+      lastEvictionFilesCount,
+      lastEvictionBytesFreed,
+      lastEvictionTimestamp,
+      lastEvictedFilesNames
     );
   }
 
@@ -409,6 +473,10 @@ public class HdfsTierStorageMonitor {
     lastFlushedHFileSize = 0;
     lastFlushedHFileName = "";
     lastFlushedTimestamp = 0;
+    lastEvictionFilesCount = 0;
+    lastEvictionBytesFreed = 0;
+    lastEvictionTimestamp = 0;
+    lastEvictedFilesNames = "";
     LOG.info("Storage monitor metrics reset");
   }
 
@@ -474,6 +542,10 @@ public class HdfsTierStorageMonitor {
     public final long lastFlushedTimestamp;
     public final long lastReconciliationTime;
     public final boolean reconciliationInProgress;
+    public final int lastEvictionFilesCount;
+    public final long lastEvictionBytesFreed;
+    public final long lastEvictionTimestamp;
+    public final String lastEvictedFilesNames;
 
     public StorageMetrics(
       long totalStorageUsed,
@@ -484,7 +556,11 @@ public class HdfsTierStorageMonitor {
       long lastFlushedHFileSize,
       long lastFlushedTimestamp,
       long lastReconciliationTime,
-      boolean reconciliationInProgress) {
+      boolean reconciliationInProgress,
+      int lastEvictionFilesCount,
+      long lastEvictionBytesFreed,
+      long lastEvictionTimestamp,
+      String lastEvictedFilesNames) {
       this.totalStorageUsed = totalStorageUsed;
       this.totalAllocatedSize = totalAllocatedSize;
       this.totalHFilesFlushed = totalHFilesFlushed;
@@ -494,6 +570,10 @@ public class HdfsTierStorageMonitor {
       this.lastFlushedTimestamp = lastFlushedTimestamp;
       this.lastReconciliationTime = lastReconciliationTime;
       this.reconciliationInProgress = reconciliationInProgress;
+      this.lastEvictionFilesCount = lastEvictionFilesCount;
+      this.lastEvictionBytesFreed = lastEvictionBytesFreed;
+      this.lastEvictionTimestamp = lastEvictionTimestamp;
+      this.lastEvictedFilesNames = lastEvictedFilesNames;
     }
 
     /**
@@ -531,6 +611,13 @@ public class HdfsTierStorageMonitor {
           "    \"sizeMB\": %.3f,\n" +
           "    \"timestamp\": %d\n" +
           "  },\n" +
+          "  \"lastEviction\": {\n" +
+          "    \"filesCount\": %d,\n" +
+          "    \"bytesFreed\": %d,\n" +
+          "    \"bytesFreedMB\": %.3f,\n" +
+          "    \"timestamp\": %d,\n" +
+          "    \"fileNames\": \"%s\"\n" +
+          "  },\n" +
           "  \"reconciliation\": {\n" +
           "    \"lastReconciliationTime\": %d,\n" +
           "    \"minutesSinceReconciliation\": %d,\n" +
@@ -548,6 +635,11 @@ public class HdfsTierStorageMonitor {
         lastFlushedHFileSize,
         lastFlushedHFileSize / (1024.0 * 1024),
         lastFlushedTimestamp,
+        lastEvictionFilesCount,
+        lastEvictionBytesFreed,
+        lastEvictionBytesFreed / (1024.0 * 1024),
+        lastEvictionTimestamp,
+        lastEvictedFilesNames,
         lastReconciliationTime,
         minutesSinceReconciliation,
         reconciliationInProgress

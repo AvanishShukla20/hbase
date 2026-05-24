@@ -67,14 +67,14 @@ public class HDFSTierEvictionChore extends ScheduledChore {
   private static final String CONFIG_EVICTION_ENABLED = "hbase.hdfstier.eviction.enabled";
   private static final String CONFIG_EVICTION_THRESHOLD = "hbase.hdfstier.eviction.threshold";
   private static final String CONFIG_EVICTION_TARGET = "hbase.hdfstier.eviction.target";
-  private static final String CONFIG_MAX_STORAGE = "hbase.hdfstier.storage.max.bytes";
+  private static final String CONFIG_MAX_STORAGE = "hbase.hdfstier.max.storage.size";
 
   // Default values
   private static final int DEFAULT_CHORE_PERIOD_SEC = 300; // 5 minutes
   private static final int DEFAULT_CHORE_DELAY_SEC = 60;   // 1 minute initial delay
   private static final double DEFAULT_THRESHOLD = 90.0;
   private static final double DEFAULT_TARGET = 70.0;
-  private static final long DEFAULT_MAX_STORAGE = 100L * 1024 * 1024 * 1024; // 100GB
+  private static final long DEFAULT_MAX_STORAGE = 1073741824L; // 1 GB (1024*1024*1024)
 
   // Dependencies
   private final HDFSTierEvictionCoordinator evictionCoordinator;

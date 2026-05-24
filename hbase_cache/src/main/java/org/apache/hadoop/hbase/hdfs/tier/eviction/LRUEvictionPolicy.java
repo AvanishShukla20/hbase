@@ -119,10 +119,16 @@ public class LRUEvictionPolicy implements EvictionPolicy {
 
     LOG.info("Found {} eviction candidates (ACTIVE, non-evicted)", allCandidates.size());
 
+    // Check if there are no ACTIVE files available for eviction
+    if (allCandidates.isEmpty()) {
+      LOG.warn("No ACTIVE files found in metadata table - eviction cannot proceed");
+      return new ArrayList<>();
+    }
+
     // Sort by lastAccessTime (ascending) - oldest first
     allCandidates.sort(Comparator.comparingLong(HFileEvictionCandidate::getLastAccessTime));
 
-    // Select files until we reach target bytes
+    // Select files until we reach target bytes OR run out of ACTIVE files
     List<HFileEvictionCandidate> selectedFiles = new ArrayList<>();
     long bytesSelected = 0;
 
@@ -131,8 +137,16 @@ public class LRUEvictionPolicy implements EvictionPolicy {
       bytesSelected += candidate.getSize();
 
       if (bytesSelected >= targetBytesToEvict) {
+        LOG.info("Target bytes reached: selected {} bytes from {} files (target: {} bytes)",
+                 bytesSelected, selectedFiles.size(), targetBytesToEvict);
         break;
       }
+    }
+
+    // Check if we ran out of files before reaching target
+    if (bytesSelected < targetBytesToEvict) {
+      LOG.warn("Insufficient ACTIVE files to reach target: selected {} bytes from {} files (target: {} bytes, shortfall: {} bytes)",
+               bytesSelected, selectedFiles.size(), targetBytesToEvict, (targetBytesToEvict - bytesSelected));
     }
 
     LOG.info("Selected {} files for eviction ({} bytes) using LRU policy",

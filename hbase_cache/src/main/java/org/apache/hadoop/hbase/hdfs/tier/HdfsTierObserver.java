@@ -1,6 +1,8 @@
 package org.apache.hadoop.hbase.hdfs.tier;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.CoprocessorEnvironment;
 import org.apache.hadoop.hbase.coprocessor.*;
@@ -14,7 +16,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * HBase Coprocessor Observer captures HFile metadata during flush and compaction operations.
@@ -57,6 +64,10 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
 
       // Initialize storage monitor singleton
       this.storageMonitor = HdfsTierStorageMonitor.getInstance(conf);
+
+      // Trigger immediate reconciliation as soon as HdfsTierObserver is loaded
+      LOG.info("Triggering storage reconciliation on HdfsTierObserver initialization");
+      this.storageMonitor.forceReconciliation();
 
       // Initialize eviction coordinator
       try {
@@ -431,56 +442,123 @@ public class HdfsTierObserver implements RegionCoprocessor, RegionObserver {
       LOG.info("Total size removed: {} bytes ({} MB)",
                totalSizeRemoved, totalSizeRemoved / (1024.0 * 1024));
 
-      // Capture metadata for NEW compacted output file
+      // Capture metadata for NEW compacted output file(s)
+      // NOTE: HBase can produce multiple output files from a single compaction if the result is large
+      // The resultFile parameter may only reference one of them, so we check the store for all new files
+
+      List<StoreFile> newFiles = new ArrayList<>();
+      long totalNewFileSize = 0;
+
+      // Start with the provided resultFile
       if (resultFile != null) {
-        try {
-          Path newFilePath = resultFile.getPath();
-          String newFileName = newFilePath.getName();
+        newFiles.add(resultFile);
+      }
 
-          // Result file is a HFile
-          if (resultFile.isReference()) {
-            LOG.warn("Result file is a reference (unexpected): {}", newFileName);
+      // Check store for additional files that may have been created during this compaction
+      // This handles cases where compaction produces multiple output files
+      try {
+        Collection<? extends StoreFile> storeFiles = store.getStorefiles();
+        if (storeFiles != null && !storeFiles.isEmpty()) {
+          // Get timestamp of when compaction started (approximate)
+          long compactionTime = System.currentTimeMillis();
+
+          // Look for files created very recently (within last 5 seconds)
+          // that aren't in the input files list
+          Set<String> inputFileNames = new HashSet<>();
+          for (StoreFile inputFile : inputFiles) {
+            inputFileNames.add(inputFile.getPath().getName());
           }
 
-          // HDFS cache path placeholder
-          String hdfsCachePath = "hdfs://hbase_cache/" + newFileName;
-          Path hdfsPath = new Path(hdfsCachePath);
-
-          // Capture metadata for new file
-          metadataCapture.captureHFileMetadata(
-            resultFile,
-            region,
-            newFilePath,
-            hdfsPath
-          );
-
-          // Get new file size
-          long newFileSize = 0;
-          try {
-            if (resultFile instanceof HStoreFile) {
-              StoreFileReader reader = ((HStoreFile) resultFile).getReader();
-              if (reader != null) {
-                newFileSize = reader.length();
-              }
+          for (StoreFile sf : storeFiles) {
+            String fileName = sf.getPath().getName();
+            // Skip if it was an input file
+            if (inputFileNames.contains(fileName)) {
+              continue;
             }
-          } catch (Exception e) {
-            LOG.warn("Failed to get size for new file: {}", e.getMessage());
+
+            // If we already have this file from resultFile, skip
+            if (resultFile != null && fileName.equals(resultFile.getPath().getName())) {
+              continue;
+            }
+
+            // Check if file is new (created recently)
+            try {
+              FileSystem fs = sf.getPath().getFileSystem(conf);
+              FileStatus fileStatus = fs.getFileStatus(sf.getPath());
+              long fileModTime = fileStatus.getModificationTime();
+
+              // If modified within last 10 seconds, likely from this compaction
+              if (compactionTime - fileModTime < 10000) {
+                newFiles.add(sf);
+                LOG.info("Detected additional compaction output file: {}", fileName);
+              }
+            } catch (Exception e) {
+              LOG.warn("Failed to check modification time for {}: {}", fileName, e.getMessage());
+            }
           }
-
-          // Update storage monitor
-          if (storageMonitor != null && newFileSize > 0) {
-            storageMonitor.recordCompaction(newFileName, newFileSize, totalSizeRemoved);
-            LOG.info("StorageMonitor: added {} bytes, removed {} bytes, net change: {} bytes",
-                     newFileSize, totalSizeRemoved, (newFileSize - totalSizeRemoved));
-          }
-
-          LOG.info("New compacted file captured: {} (size: {} bytes)", newFileName, newFileSize);
-
-        } catch (Exception e) {
-          LOG.error("Failed to capture new compacted file: {}", resultFile.getPath(), e);
         }
+      } catch (Exception e) {
+        LOG.warn("Failed to check store for additional output files: {}", e.getMessage());
+      }
+
+      // Process all new output files
+      if (newFiles.isEmpty()) {
+        LOG.warn("No result files found from compaction");
       } else {
-        LOG.warn("Result file is null");
+        LOG.info("Processing {} compaction output file(s)", newFiles.size());
+
+        for (StoreFile newFile : newFiles) {
+          try {
+            Path newFilePath = newFile.getPath();
+            String newFileName = newFilePath.getName();
+
+            // Result file should be a regular HFile, not a reference
+            if (newFile.isReference()) {
+              LOG.warn("Result file is a reference (unexpected): {}", newFileName);
+              continue;
+            }
+
+            // HDFS cache path placeholder
+            String hdfsCachePath = "hdfs://hbase_cache/" + newFileName;
+            Path hdfsPath = new Path(hdfsCachePath);
+
+            // Capture metadata for new file
+            metadataCapture.captureHFileMetadata(
+              newFile,
+              region,
+              newFilePath,
+              hdfsPath
+            );
+
+            // Get new file size
+            long newFileSize = 0;
+            try {
+              if (newFile instanceof HStoreFile) {
+                StoreFileReader reader = ((HStoreFile) newFile).getReader();
+                if (reader != null) {
+                  newFileSize = reader.length();
+                  totalNewFileSize += newFileSize;
+                }
+              }
+            } catch (Exception e) {
+              LOG.warn("Failed to get size for new file {}: {}", newFileName, e.getMessage());
+            }
+
+            LOG.info("Captured compaction output file: {} (size: {} bytes)", newFileName, newFileSize);
+
+          } catch (Exception e) {
+            LOG.error("Failed to capture compaction output file: {}", newFile.getPath(), e);
+          }
+        }
+
+        // Update storage monitor with aggregated values
+        if (storageMonitor != null && totalNewFileSize > 0) {
+          // Use first file name for logging purposes
+          String firstFileName = newFiles.get(0).getPath().getName();
+          storageMonitor.recordCompaction(firstFileName, totalNewFileSize, totalSizeRemoved);
+          LOG.info("StorageMonitor: added {} bytes (from {} files), removed {} bytes, net change: {} bytes",
+                   totalNewFileSize, newFiles.size(), totalSizeRemoved, (totalNewFileSize - totalSizeRemoved));
+        }
       }
 
       LOG.info("Compaction metadata capture complete");

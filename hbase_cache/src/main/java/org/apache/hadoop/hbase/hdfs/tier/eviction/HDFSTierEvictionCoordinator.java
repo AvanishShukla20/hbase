@@ -68,8 +68,8 @@ public class HDFSTierEvictionCoordinator {
     this.evictionEnabled = conf.getBoolean("hbase.hdfstier.eviction.enabled", true);
     this.evictionThresholdPercent = conf.getDouble("hbase.hdfstier.eviction.threshold", 90.0);
     this.evictionTargetPercent = conf.getDouble("hbase.hdfstier.eviction.target", 70.0);
-    this.maxStorageBytes = conf.getLong("hbase.hdfstier.storage.max.bytes",
-                                        100L * 1024 * 1024 * 1024); // 100GB default
+    this.maxStorageBytes = conf.getLong("hbase.hdfstier.max.storage.size",
+                                        1073741824L); // 1 GB default (1024*1024*1024)
 
     // Initialize executor
     this.executor = new HDFSTierEvictionExecutor(conf, metadataCapture);
@@ -119,19 +119,44 @@ public class HDFSTierEvictionCoordinator {
       long bytesFreed = executor.executeEviction(filesToEvict);
       totalBytesEvicted += bytesFreed;
 
-      // Step 3: Verify storage usage
+      // Step 3: Update storage monitor with eviction
+      if (bytesFreed > 0 && storageMonitor != null) {
+        // Build comma-separated list of evicted file names for display
+        StringBuilder fileNamesBuilder = new StringBuilder();
+        int maxFilesToShow = Math.min(10, filesToEvict.size()); // Show up to 10 files
+        for (int i = 0; i < maxFilesToShow; i++) {
+          if (i > 0) fileNamesBuilder.append(", ");
+          fileNamesBuilder.append(filesToEvict.get(i).getHfileName());
+        }
+        if (filesToEvict.size() > maxFilesToShow) {
+          fileNamesBuilder.append(", ... (").append(filesToEvict.size() - maxFilesToShow).append(" more)");
+        }
+        String evictedFileNames = fileNamesBuilder.toString();
+
+        storageMonitor.recordEviction(bytesFreed, filesToEvict.size(), evictedFileNames);
+        LOG.info("Storage monitor updated: {} bytes freed from {} files", bytesFreed, filesToEvict.size());
+      }
+
+      // Step 4: Verify storage usage
       long newUsageBytes = currentUsageBytes - bytesFreed;
       double newUsagePercent = (newUsageBytes * 100.0) / maxStorageBytes;
 
       LOG.info("Eviction complete: freed {} bytes, new usage: {} bytes ({}%)",
                bytesFreed, newUsageBytes, String.format("%.2f", newUsagePercent));
 
-      // Step 4: Check if we reached target
+      // Step 5: Check if we reached target
       if (newUsagePercent > evictionTargetPercent) {
         LOG.warn("Storage usage {}% still above target {}% after eviction",
                  String.format("%.2f", newUsagePercent), String.format("%.2f", evictionTargetPercent));
       } else {
         LOG.info("Successfully reduced storage usage to target level");
+      }
+
+      // Step 6: Trigger storage reconciliation after eviction completes
+      // This ensures the storage monitor reflects the accurate state after eviction
+      LOG.info("Triggering storage reconciliation after eviction completion");
+      if (storageMonitor != null) {
+        storageMonitor.forceReconciliation();
       }
 
     } catch (Exception e) {
